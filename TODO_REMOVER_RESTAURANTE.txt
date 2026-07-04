@@ -1,0 +1,26 @@
+IMPORTANTE: REMOVER ENDPOINTS DE RESTAURANTE
+
+Os seguintes endpoints foram desabilitados (removidos de sync.specific.routes.ts):
+- POST /rest-group/sincronize
+- POST /rest-group-has-attribute/sincronize
+- POST /rest-group-has-measure/sincronize
+- POST /rest-group-has-optional/sincronize
+- POST /rest-menu/sincronize
+- POST /rest-menu-has-ingrediente/sincronize
+- POST /rest-subgroup/sincronize
+
+Os arquivos ainda existem em:
+- src/modules/sync/endpoints/restgroup.ts
+- src/modules/sync/endpoints/restgrouphasattribute.ts
+- src/modules/sync/endpoints/restgrouphasmeasure.ts
+- src/modules/sync/endpoints/restgrouphasoptional.ts
+- src/modules/sync/endpoints/restmenu.ts
+- src/modules/sync/endpoints/restmenuhasingrediente.ts
+- src/modules/sync/endpoints/restsubgroup.ts
+
+Para limpeza completa, delete manualmente estes 7 arquivos via:
+1. Windows Explorer
+2. Git: git rm src/modules/sync/endpoints/rest*.ts
+3. Terminal: rm -f src/modules/sync/endpoints/rest*.ts
+
+Endpoints ativos: 23 (era 30)
