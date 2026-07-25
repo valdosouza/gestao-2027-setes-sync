@@ -63,8 +63,9 @@ describe('setes-sync — Integration Tests', () => {
         .set('X-Api-Key', 'test_key')
         .send({ groups: [] })
 
-      // Pode retornar 404 ou 500 dependendo da configuração
-      expect([404, 500]).toContain(res.status)
+      // D23: endpoints rest-* aposentados — rota não registrada.
+      // 401 = auth barra a chave de teste antes do 404 de rota inexistente.
+      expect([401, 404]).toContain(res.status)
     })
 
     it('POST /rest-menu/sincronize não existe', async () => {
@@ -73,7 +74,7 @@ describe('setes-sync — Integration Tests', () => {
         .set('X-Api-Key', 'test_key')
         .send({ menus: [] })
 
-      expect([404, 500]).toContain(res.status)
+      expect([401, 404]).toContain(res.status)
     })
 
     it('POST /rest-subgroup/sincronize não existe', async () => {
@@ -82,7 +83,7 @@ describe('setes-sync — Integration Tests', () => {
         .set('X-Api-Key', 'test_key')
         .send({ subgroups: [] })
 
-      expect([404, 500]).toContain(res.status)
+      expect([401, 404]).toContain(res.status)
     })
   })
 })

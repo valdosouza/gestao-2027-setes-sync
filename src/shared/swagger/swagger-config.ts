@@ -93,7 +93,10 @@ const options = {
       },
     ],
   },
-  apis: ['./src/app.ts', './src/shared/swagger/swagger-endpoints.ts'],
+  // Revisão do sincronizador (Onda 5): cada endpoint carrega o próprio bloco
+  // @swagger no arquivo — o swagger-endpoints.ts legado (docs centralizadas e
+  // defasadas) foi aposentado. Só o que está nestes globs aparece no /docs.
+  apis: ['./src/app.ts', './src/modules/sync/endpoints/*.ts'],
 }
 
 export const swaggerSpec = swaggerJsdoc(options)

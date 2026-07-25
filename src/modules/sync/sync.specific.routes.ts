@@ -8,8 +8,12 @@ import categoryRouter              from './endpoints/category'
 import customerRouter              from './endpoints/customer'
 import filexmlRouter               from './endpoints/filexml'
 import financialRouter             from './endpoints/financial'
+import invoiceRouter               from './endpoints/invoice'
+import invoicemerchandiseRouter    from './endpoints/invoicemerchandise'
+import invoicereturnRouter         from './endpoints/invoicereturn'
 import financialplansRouter        from './endpoints/financialplans'
 import financialstatementRouter    from './endpoints/financialstatement'
+import measureRouter               from './endpoints/measure'
 import merchandiseRouter           from './endpoints/merchandise'
 import orderpurchaseRouter         from './endpoints/orderpurchase'
 import ordersaleRouter             from './endpoints/ordersale'
@@ -40,8 +44,12 @@ router.use(categoryRouter)
 router.use(customerRouter)
 router.use(filexmlRouter)
 router.use(financialRouter)
+router.use(invoiceRouter)
+router.use(invoicemerchandiseRouter)
+router.use(invoicereturnRouter)
 router.use(financialplansRouter)
 router.use(financialstatementRouter)
+router.use(measureRouter)
 router.use(merchandiseRouter)
 router.use(orderpurchaseRouter)
 router.use(ordersaleRouter)

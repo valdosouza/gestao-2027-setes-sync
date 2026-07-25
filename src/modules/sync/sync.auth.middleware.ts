@@ -2,9 +2,12 @@ import { Request, Response, NextFunction } from 'express'
 import pool   from '@shared/db/connection'
 import logger from '@shared/logger/logger'
 
+// Decisão D12 (prompt_revisao_sincronizador_setes_sync.md): UMA API key por
+// instalação/cliente em setes_central.tb_sync_api_key. institutionId + schemaName
+// resolvidos aqui via JOIN em tb_institution (fonte única do schema_name).
 export interface SyncClient {
+  institutionId:     number
   establishmentCode: string
-  tenantId:          string
   schemaName:        string
 }
 
@@ -26,17 +29,18 @@ async function resolveApiKey(apiKey: string): Promise<SyncClient | null> {
   if (cached && cached.expiresAt > now) return cached.client
 
   const [rows] = await pool.query<any[]>(
-    `SELECT establishment_code, tenant_id, schema_name
-     FROM setes_central.sync_api_keys
-     WHERE api_key = ? AND active = TRUE`,
+    `SELECT sak.tb_institution_id, sak.establishment_code, i.schema_name
+     FROM setes_central.tb_sync_api_key sak
+     JOIN setes_central.tb_institution i ON i.id = sak.tb_institution_id
+     WHERE sak.api_key = ? AND sak.active = 'S' AND sak.deleted = 'N'`,
     [apiKey]
   )
 
   if (!rows.length) return null
 
   const client: SyncClient = {
+    institutionId:     rows[0].tb_institution_id,
     establishmentCode: rows[0].establishment_code,
-    tenantId:          rows[0].tenant_id,
     schemaName:        rows[0].schema_name,
   }
 
@@ -48,7 +52,7 @@ export function syncAuthMiddleware(req: Request, res: Response, next: NextFuncti
   const apiKey = req.headers['x-api-key'] as string
 
   if (!apiKey) {
-    res.status(401).json({ error: 'X-Api-Key header obrigatorio' })
+    res.status(401).json({ ok: false, error: 'X-Api-Key header obrigatorio' })
     return
   }
 
@@ -56,11 +60,11 @@ export function syncAuthMiddleware(req: Request, res: Response, next: NextFuncti
     .then(client => {
       if (!client) {
         logger.warn('API Key invalida ou inativa', { apiKey: apiKey.slice(0, 8) + '...' })
-        res.status(401).json({ error: 'API Key invalida' })
+        res.status(401).json({ ok: false, error: 'API Key invalida' })
         return
       }
       req.syncClient = client
       next()
     })
-    .catch(() => res.status(500).json({ error: 'Erro ao validar API Key' }))
+    .catch(() => res.status(500).json({ ok: false, error: 'Erro ao validar API Key' }))
 }

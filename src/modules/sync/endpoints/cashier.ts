@@ -1,75 +1,99 @@
 import { Router, Request, Response } from 'express'
+import { z } from 'zod'
 import pool from '@shared/db/connection'
 import { syncSuccess, syncError } from '../sync.response'
-import { nextId } from '../sync.id-generator'
-import { normalizeDate } from '../sync.date'
+import { HttpError } from '@shared/errors/http-error'
 import logger from '@shared/logger/logger'
 
 const router = Router()
 
+/**
+ * Caixa — id local ✅ (id do caixa no Firebird; PK id+institution+terminal).
+ * tb_userid fica NULL: o usuário local do Firebird NÃO viaja (a reindexação
+ * de usuários pertence à revisão do sync — ids do legado nunca indexam a
+ * web, D3). O contrato antigo com `items` (tb_cashier_items) foi REMOVIDO
+ * deste endpoint — fechamento por forma de pagamento entra em endpoint
+ * próprio quando a onda de movimento financeiro o definir.
+ * Contrato: CONTRATOS_SYNC.md.
+ */
+const DATETIME_RX = /^\d{4}-\d{2}-\d{2}([ T]\d{2}:\d{2}(:\d{2})?)?$/
+
+const cashierBody = z.object({
+  id:       z.number().int().positive(),
+  terminal: z.number().int().min(0),
+  dtRecord: z.string().regex(DATETIME_RX),
+  hrBegin:  z.string().regex(DATETIME_RX).nullable().optional(),
+  hrEnd:    z.string().regex(DATETIME_RX).nullable().optional(),
+  deleted:  z.enum(['S', 'N']).optional().default('N'),
+})
+
+/**
+ * @swagger
+ * /cashier/sincronize:
+ *   post:
+ *     summary: Sincronizar Caixa (id local)
+ *     description: >-
+ *       Upsert em tb_cashier com id local do Firebird (PK id+institution+
+ *       terminal). tb_userid fica NULL — usuário local do legado não viaja.
+ *       Datas em YYYY-MM-DD[ HH:MM[:SS]].
+ *     tags: [Sincronização]
+ *     security: [{ ApiKeyAuth: [] }]
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [id, terminal, dtRecord]
+ *             properties:
+ *               id: { type: integer, example: 91 }
+ *               terminal: { type: integer, example: 1 }
+ *               dtRecord: { type: string, example: "2026-07-19" }
+ *               hrBegin: { type: string, example: "2026-07-19 08:00:00" }
+ *               hrEnd: { type: string, example: "2026-07-19 18:12:00" }
+ *               deleted: { type: string, enum: [S, N] }
+ *     responses:
+ *       200: { description: "{ ok, id }" }
+ *       400: { description: Payload inválido }
+ *       401: { description: X-Api-Key inválida ou ausente }
+ *       500: { description: Erro ao processar }
+ */
 router.post('/cashier/sincronize', async (req: Request, res: Response) => {
   const conn = await pool.getConnection()
   try {
+    const parsed = cashierBody.safeParse(req.body)
+    if (!parsed.success) {
+      throw new HttpError(400, 'Payload inválido',
+        parsed.error.issues.map(i => ({ field: i.path.join('.'), message: i.message })))
+    }
+    const b = parsed.data
+    const { institutionId, schemaName } = req.syncClient!
+
     await conn.beginTransaction()
-    await conn.query(`USE \`${req.syncClient!.schemaName}\``)
+    await conn.query(`USE \`${schemaName}\``)
 
-    const b = req.body
-    const institutionId: number = b.tb_institution_id
-    const dtRecord = normalizeDate(b.dt_record)
-    const hrBegin  = normalizeDate(b.hr_begin)
-    const hrEnd    = normalizeDate(b.hr_end)
-
-    const [existing] = await conn.query<any[]>(
-      `SELECT id FROM tb_Cashier WHERE tb_institution_id = ? AND terminal = ? AND dt_record = ? LIMIT 1`,
-      [institutionId, b.terminal, dtRecord]
+    await conn.query(
+      `INSERT INTO tb_cashier
+         (id, tb_institution_id, terminal, dt_record, tb_userid,
+          hr_begin, hr_end, deleted, created_at, updated_at)
+       VALUES (?, ?, ?, ?, NULL, ?, ?, ?, NOW(), NOW())
+       ON DUPLICATE KEY UPDATE
+         dt_record = VALUES(dt_record), hr_begin = VALUES(hr_begin),
+         hr_end = VALUES(hr_end), deleted = VALUES(deleted), updated_at = NOW()`,
+      [b.id, institutionId, b.terminal, b.dtRecord,
+       b.hrBegin ?? null, b.hrEnd ?? null, b.deleted]
     )
 
-    let cashierId: number
-    if (existing.length === 0) {
-      cashierId = await nextId(conn, 'tb_Cashier', institutionId)
-      await conn.query(
-        `INSERT INTO tb_Cashier (id, tb_institution_id, terminal, dt_record, tb_userid, hr_begin, hr_end, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, NOW(), NOW())`,
-        [cashierId, institutionId, b.terminal, dtRecord, b.tb_userid, hrBegin, hrEnd]
-      )
-    } else {
-      cashierId = existing[0].id
-      await conn.query(
-        `UPDATE tb_Cashier SET tb_userid = ?, hr_begin = ?, hr_end = ?, updated_at = NOW()
-         WHERE id = ? AND tb_institution_id = ?`,
-        [b.tb_userid, hrBegin, hrEnd, cashierId, institutionId]
-      )
-    }
-
-    if (Array.isArray(b.items)) {
-      for (const item of b.items) {
-        const [ei] = await conn.query<any[]>(
-          `SELECT id FROM tb_cashier_items WHERE tb_cashier_id = ? AND tb_payment_types_id = ? AND kind = ? LIMIT 1`,
-          [cashierId, item.tb_payment_types_id, item.kind]
-        )
-        if (ei.length === 0) {
-          const itemId = await nextId(conn, 'tb_cashier_items', institutionId)
-          await conn.query(
-            `INSERT INTO tb_cashier_items (id, tb_institution_id, tb_cashier_id, tb_payment_types_id, kind, tag_value, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, NOW(), NOW())`,
-            [itemId, institutionId, cashierId, item.tb_payment_types_id, item.kind, item.tag_value]
-          )
-        } else {
-          await conn.query(
-            `UPDATE tb_cashier_items SET tag_value = ?, updated_at = NOW()
-             WHERE id = ? AND tb_institution_id = ?`,
-            [item.tag_value, ei[0].id, institutionId]
-          )
-        }
-      }
-    }
-
     await conn.commit()
-    res.json(syncSuccess(institutionId))
+    res.json(syncSuccess(b.id))
   } catch (err: any) {
     await conn.rollback()
+    if (err instanceof HttpError) {
+      res.status(err.statusCode).json({ ok: false, error: err.message, fields: err.fields, code: err.code })
+      return
+    }
     logger.error('Erro em /cashier/sincronize', { err, client: req.syncClient })
-    res.json(syncError(err.message))
+    res.status(500).json(syncError(err.message))
   } finally {
     conn.release()
   }
