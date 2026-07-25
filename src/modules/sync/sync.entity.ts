@@ -1,6 +1,8 @@
 import { PoolConnection } from 'mysql2/promise'
 import { z } from 'zod'
+import pool from '@shared/db/connection'
 import { HttpError } from '@shared/errors/http-error'
+import logger from '@shared/logger/logger'
 import {
   EntityFiscalInput,
   entityFiscalBody,
@@ -22,6 +24,14 @@ import {
  *       o externalCode; o Sincronizador grava em tb_empresa.externalCode (D4).
  *     · payload COM externalCode → resolve a entity pelo UUID; não achou =
  *       erro (o Firebird diz ter um vínculo que a central não conhece).
+ * - GRADUAÇÃO (prompt_correcao_documento_entidade.md, 4 decisões 2026-07-25):
+ *   F/J COM externalCode = o sem-doc foi corrigido no Gestão. A entity do
+ *   externalCode GANHA o documento (mesmo tb_entity.id — histórico intacto;
+ *   o toggle do upsertFiscal soft-deleta tb_no_doc) e o envelope devolve
+ *   clearExternalCode:true para o Sincronizador limpar o vínculo (decisão 1).
+ *   Documento já em OUTRA entity → NUNCA mescla: conflito em tb_sync_conflict
+ *   (decisão 2) e a entity segue como sem-doc. Órfão: segue por documento SÓ
+ *   se o documento estiver livre (decisão 3); ocupado → 409 + conflito.
  * - Cadeia INTEIRA em setes_central (D13) — quem grava o PAPEL no schema do
  *   cliente é o endpoint chamador, sempre com id = entityId daqui.
  */
@@ -61,6 +71,15 @@ export interface SyncEntityResult {
   externalCode?: string
   /** true = entity reaproveitada (documento/UUID já existia na central). */
   reused:        boolean
+  /** true = graduação concluída (decisão 1): o Sincronizador deve LIMPAR o
+   *  EXTERNALCODE no Firebird — o documento passou a ser o índice. */
+  clearExternalCode?: boolean
+}
+
+/** Contexto do endpoint chamador — usado no registro de conflitos (decisão 2). */
+export interface SyncContext {
+  origin:        string
+  institutionId: number
 }
 
 // ---------------------------------------------------------------------
@@ -168,16 +187,58 @@ async function syncMailings(
   }
 }
 
+/** O externalCode pertence à (soft-deletada ou não) tb_no_doc DESTA entity?
+ *  Distingue a regravação pós-graduação (caso B — o Firebird ainda não limpou
+ *  o EXTERNALCODE e a tb_no_doc já foi soft-deletada pelo toggle) de um
+ *  órfão genuíno. */
+async function externalCodeBelongsToEntity(
+  conn: PoolConnection, externalCode: string, entityId: number
+): Promise<boolean> {
+  const [rows] = await conn.query<any[]>(
+    `SELECT 1 FROM setes_central.tb_no_doc WHERE external_id = ? AND id = ? LIMIT 1`,
+    [externalCode, entityId]
+  )
+  return rows.length > 0
+}
+
+/** Decisão 2: fila central de conflitos para ação manual. Usa o POOL
+ *  (autocommit) — precisa sobreviver ao rollback do endpoint (caso 409). */
+async function registerSyncConflict(
+  ctx: SyncContext | undefined, document: string, externalCode: string,
+  entityIdDoc: number | null, entityIdExt: number | null, message: string
+): Promise<void> {
+  logger.warn('Conflito de sincronização de entidade', {
+    ctx, document, externalCode, entityIdDoc, entityIdExt, message,
+  })
+  if (!ctx) return
+  await pool.query(
+    `INSERT INTO setes_central.tb_sync_conflict
+       (tb_institution_id, document, external_code, tb_entity_id_doc,
+        tb_entity_id_ext, origin, message, resolved, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, 'N', NOW(), NOW())
+     ON DUPLICATE KEY UPDATE
+       tb_entity_id_doc = VALUES(tb_entity_id_doc),
+       tb_entity_id_ext = VALUES(tb_entity_id_ext),
+       message = VALUES(message), resolved = 'N', updated_at = NOW()`,
+    [ctx.institutionId, document, externalCode, entityIdDoc, entityIdExt, ctx.origin, message]
+  )
+}
+
 /**
  * Salva/reindexa a entidade do pacote DENTRO da transação do endpoint.
  * O chamador grava o papel (tb_customer/...) no schema do cliente com o
- * entityId devolvido — e repassa o externalCode no envelope (D14).
+ * entityId devolvido — e repassa externalCode/clearExternalCode no envelope.
  */
 export async function saveSyncEntity(
-  conn: PoolConnection, input: SyncEntityInput
+  conn: PoolConnection, input: SyncEntityInput, ctx?: SyncContext
 ): Promise<SyncEntityResult> {
   let entityId: number
   let reused: boolean
+  let clearExternalCode: boolean | undefined
+
+  const doc = input.personType === 'F' ? input.person?.cpf
+            : input.personType === 'J' ? input.company?.cnpj
+            : undefined
 
   if (input.personType === 'N' && input.externalCode) {
     const existing = await findEntityIdByExternalCode(conn, input.externalCode)
@@ -192,6 +253,58 @@ export async function saveSyncEntity(
     const result = await saveEntityFiscalChain(conn, existing, input)
     entityId = result.id
     reused   = true
+  } else if (doc && input.externalCode) {
+    // GRADUAÇÃO (prompt_correcao_documento_entidade.md): sem-doc corrigido
+    const docId = await findEntityIdByDocument(conn, doc)
+    const extId = await findEntityIdByExternalCode(conn, input.externalCode)
+
+    if (extId !== null && (docId === null || docId === extId)) {
+      // Caso A (documento livre) — a entity do externalCode ganha o documento;
+      // o toggle do upsertFiscal soft-deleta a tb_no_doc. Mesmo id, histórico intacto.
+      const result = await saveEntityFiscalChain(conn, extId, input)
+      entityId = result.id
+      reused   = true
+      clearExternalCode = true
+    } else if (extId !== null && docId !== null) {
+      // Caso C — documento já pertence a OUTRA entity: NUNCA mescla (decisão 2).
+      // A entity do externalCode segue atualizada como SEM-DOC; ação manual.
+      await registerSyncConflict(ctx, doc, input.externalCode, docId, extId,
+        'Documento já pertence a outra entity — graduação bloqueada, ação manual')
+      const asNoDoc: SyncEntityInput = { ...input, personType: 'N', person: null, company: null }
+      const result = await saveEntityFiscalChain(conn, extId, asNoDoc)
+      entityId = result.id
+      reused   = true
+    } else if (docId !== null) {
+      if (await externalCodeBelongsToEntity(conn, input.externalCode, docId)) {
+        // Caso B — regravação pós-graduação (tb_no_doc já soft-deletada, o
+        // Firebird ainda não limpou o EXTERNALCODE): idempotente + limpar de novo.
+        const result = await saveEntityFiscalChain(conn, docId, input)
+        entityId = result.id
+        reused   = true
+        clearExternalCode = true
+      } else {
+        // Caso D2 — órfão E documento ocupado (refinamento do Valdo na
+        // decisão 3): nada é gravado automaticamente; conflito manual.
+        await registerSyncConflict(ctx, doc, input.externalCode, docId, null,
+          'externalCode órfão com documento já ocupado — nada gravado, ação manual')
+        throw new HttpError(
+          409,
+          `externalCode órfão e documento ${doc} já pertence a outra entity`,
+          [{ field: 'externalCode', message: 'conflito registrado — resolver manualmente' }],
+          'EXTERNAL_CODE_ORPHAN'
+        )
+      }
+    } else {
+      // Caso D1 — órfão com documento LIVRE (decisão 3): o documento vira o
+      // índice; cria/atualiza por ele e manda limpar o órfão do Firebird.
+      logger.warn('externalCode órfão descartado — seguindo por documento', {
+        ctx, externalCode: input.externalCode, document: doc,
+      })
+      const result = await saveEntityFiscalChain(conn, null, input)
+      entityId = result.id
+      reused   = result.reused
+      clearExternalCode = true
+    }
   } else {
     const result = await saveEntityFiscalChain(conn, null, input)
     entityId = result.id
@@ -205,5 +318,5 @@ export async function saveSyncEntity(
   const externalCode =
     input.personType === 'N' ? await getExternalCode(conn, entityId) : undefined
 
-  return { entityId, externalCode, reused }
+  return { entityId, externalCode, reused, clearExternalCode }
 }

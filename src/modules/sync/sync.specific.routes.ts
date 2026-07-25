@@ -3,6 +3,7 @@ import { syncAuthMiddleware } from './sync.auth.middleware'
 
 import bankaccountRouter           from './endpoints/bankaccount'
 import brandRouter                 from './endpoints/brand'
+import carrierRouter               from './endpoints/carrier'
 import cashierRouter               from './endpoints/cashier'
 import categoryRouter              from './endpoints/category'
 import customerRouter              from './endpoints/customer'
@@ -39,6 +40,7 @@ router.use((req, res, next) => {
 
 router.use(bankaccountRouter)
 router.use(brandRouter)
+router.use(carrierRouter)
 router.use(cashierRouter)
 router.use(categoryRouter)
 router.use(customerRouter)

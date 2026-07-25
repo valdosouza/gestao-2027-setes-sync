@@ -159,6 +159,98 @@ describe('motor de reindexação (sync.entity)', () => {
     expect(rows.map(r => r.email)).toContain(email)
   })
 
+  // -------------------------------------------------------------------
+  // Graduação do sem-doc (prompt_correcao_documento_entidade.md, 2026-07-25)
+  // -------------------------------------------------------------------
+
+  it('graduação (caso A): sem-doc corrigido MANTÉM o tb_entity.id e pede limpeza', async () => {
+    const noDoc = await inTransaction(conn =>
+      saveSyncEntity(conn, baseInput({ personType: 'N' })))
+    createdEntityIds.push(noDoc.entityId)
+
+    const cpf = genCpf()
+    const graduated = await inTransaction(conn =>
+      saveSyncEntity(conn, baseInput({
+        personType: 'F', person: { cpf },
+        externalCode: noDoc.externalCode,
+      })))
+
+    expect(graduated.entityId).toBe(noDoc.entityId)          // histórico intacto
+    expect(graduated.clearExternalCode).toBe(true)           // decisão 1
+
+    const [person] = await pool.query<any[]>(
+      `SELECT cpf FROM setes_central.tb_person WHERE id = ? AND deleted = 'N'`, [noDoc.entityId])
+    expect(person[0]?.cpf).toBe(cpf)
+    const [nodoc] = await pool.query<any[]>(
+      `SELECT deleted FROM setes_central.tb_no_doc WHERE id = ?`, [noDoc.entityId])
+    expect(nodoc[0]?.deleted).toBe('S')                      // toggle soft-deletou
+  })
+
+  it('graduação (caso B): regravação pós-graduação é idempotente e pede limpeza de novo', async () => {
+    const noDoc = await inTransaction(conn =>
+      saveSyncEntity(conn, baseInput({ personType: 'N' })))
+    createdEntityIds.push(noDoc.entityId)
+    const cpf = genCpf()
+    const payload = baseInput({
+      personType: 'F', person: { cpf }, externalCode: noDoc.externalCode,
+    })
+    await inTransaction(conn => saveSyncEntity(conn, payload))
+    // Firebird ainda não limpou o EXTERNALCODE e reenvia o mesmo payload
+    const again = await inTransaction(conn => saveSyncEntity(conn, payload))
+    expect(again.entityId).toBe(noDoc.entityId)
+    expect(again.clearExternalCode).toBe(true)
+  })
+
+  it('graduação (caso C): documento de OUTRA entity NUNCA mescla — segue sem-doc', async () => {
+    const cpf = genCpf()
+    const dono = await inTransaction(conn =>
+      saveSyncEntity(conn, baseInput({ personType: 'F', person: { cpf } })))
+    createdEntityIds.push(dono.entityId)
+    const noDoc = await inTransaction(conn =>
+      saveSyncEntity(conn, baseInput({ personType: 'N' })))
+    createdEntityIds.push(noDoc.entityId)
+
+    const conflicted = await inTransaction(conn =>
+      saveSyncEntity(conn, baseInput({
+        personType: 'F', person: { cpf },                    // cpf do "dono"
+        externalCode: noDoc.externalCode,
+      })))
+
+    expect(conflicted.entityId).toBe(noDoc.entityId)         // segue na entity do externalCode
+    expect(conflicted.clearExternalCode).toBeUndefined()     // vínculo mantido
+    const [nodoc] = await pool.query<any[]>(
+      `SELECT deleted FROM setes_central.tb_no_doc WHERE id = ?`, [noDoc.entityId])
+    expect(nodoc[0]?.deleted).toBe('N')                      // continua sem-doc
+    const [person] = await pool.query<any[]>(
+      `SELECT id FROM setes_central.tb_person WHERE id = ?`, [noDoc.entityId])
+    expect(person.length).toBe(0)                            // documento NÃO gravado nela
+  })
+
+  it('graduação (caso D1): órfão com documento LIVRE segue por documento + limpeza', async () => {
+    const cpf = genCpf()
+    const result = await inTransaction(conn =>
+      saveSyncEntity(conn, baseInput({
+        personType: 'F', person: { cpf },
+        externalCode: '00000000-0000-4000-8000-000000000001',
+      })))
+    createdEntityIds.push(result.entityId)
+    expect(result.clearExternalCode).toBe(true)
+  })
+
+  it('graduação (caso D2): órfão com documento OCUPADO → 409 EXTERNAL_CODE_ORPHAN', async () => {
+    const cpf = genCpf()
+    const dono = await inTransaction(conn =>
+      saveSyncEntity(conn, baseInput({ personType: 'F', person: { cpf } })))
+    createdEntityIds.push(dono.entityId)
+
+    await expect(inTransaction(conn =>
+      saveSyncEntity(conn, baseInput({
+        personType: 'F', person: { cpf },
+        externalCode: '00000000-0000-4000-8000-000000000002',
+      })))
+    ).rejects.toMatchObject({ statusCode: 409, code: 'EXTERNAL_CODE_ORPHAN' })
+  })
+
   it('contrato Zod: máscara removida passa; personType J sem company falha', () => {
     const masked = stripDocumentMasks({
       entity: { nameCompany: 'X', nickTrade: 'X' },

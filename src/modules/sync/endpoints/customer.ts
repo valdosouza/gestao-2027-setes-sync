@@ -12,6 +12,26 @@ import logger from '@shared/logger/logger'
 const router = Router()
 
 /**
+ * Resolve documento → entity.id E confirma o papel no schema do cliente
+ * (decisão 4 da revisão de entidades): a entity existir na central não
+ * basta — sem a linha do papel o vínculo seria para um não-vendedor/
+ * não-transportadora. Nome qualificado porque a conexão ainda não deu USE.
+ */
+async function findRoleIdByDocument(
+  conn: any, schemaName: string, roleTable: 'tb_salesman' | 'tb_carrier',
+  institutionId: number, document: string
+): Promise<number | null> {
+  const entityId = await findEntityIdByDocument(conn, document)
+  if (entityId === null) return null
+  const [rows] = await conn.query(
+    `SELECT 1 FROM \`${schemaName}\`.\`${roleTable}\`
+     WHERE id = ? AND tb_institution_id = ? AND deleted = 'N'`,
+    [entityId, institutionId]
+  )
+  return (rows as any[]).length ? entityId : null
+}
+
+/**
  * Cliente — 1º papel de entidade da revisão (Onda 4). Reindexação D3/D4:
  * a cadeia (entity/person|company|no_doc/address/phone/mailing) vai para
  * setes_central pelo MOTOR (sync.entity.ts); aqui fica só o PAPEL
@@ -58,7 +78,7 @@ const entityTaxBody = z.object({
  *     tags: [Sincronização]
  *     security: [{ ApiKeyAuth: [] }]
  *     responses:
- *       200: { description: "{ ok, id, externalCode? } — id = entity.id" }
+ *       200: { description: "{ ok, id, externalCode?, clearExternalCode? } — id = entity.id" }
  *       400: { description: Payload inválido }
  *       401: { description: X-Api-Key inválida ou ausente }
  *       404: { description: externalCode desconhecido }
@@ -91,13 +111,17 @@ router.post('/customer/sincronize', async (req: Request, res: Response) => {
 
     await conn.beginTransaction()
 
-    // 1. Cadeia na CENTRAL (motor de reindexação)
-    const { entityId, externalCode } = await saveSyncEntity(conn, entityParsed.data)
+    // 1. Cadeia na CENTRAL (motor de reindexação + graduação do sem-doc)
+    const { entityId, externalCode, clearExternalCode } =
+      await saveSyncEntity(conn, entityParsed.data, { origin: 'customer', institutionId })
 
-    // 2. Referências por DOCUMENTO (D3) — informadas mas não sincronizadas → 409
+    // 2. Referências por DOCUMENTO (D3) — decisão 4 da revisão de entidades
+    //    (2026-07-25): o 409 verifica o PAPEL no schema do cliente, não só a
+    //    existência da entity (o mesmo CPF pode existir só como cliente).
     let salesmanId: number | null = null
     if (cust.salesmanDocument) {
-      salesmanId = await findEntityIdByDocument(conn, cust.salesmanDocument)
+      salesmanId = await findRoleIdByDocument(conn, schemaName, 'tb_salesman',
+        institutionId, cust.salesmanDocument)
       if (salesmanId === null) {
         throw new HttpError(409, `Vendedor ${cust.salesmanDocument} ainda não sincronizado`,
           [{ field: 'customer.salesmanDocument', message: 'sincronize o vendedor antes — reenvio no próximo ciclo' }],
@@ -106,7 +130,8 @@ router.post('/customer/sincronize', async (req: Request, res: Response) => {
     }
     let carrierId: number | null = null
     if (cust.carrierDocument) {
-      carrierId = await findEntityIdByDocument(conn, cust.carrierDocument)
+      carrierId = await findRoleIdByDocument(conn, schemaName, 'tb_carrier',
+        institutionId, cust.carrierDocument)
       if (carrierId === null) {
         throw new HttpError(409, `Transportador ${cust.carrierDocument} ainda não sincronizado`,
           [{ field: 'customer.carrierDocument', message: 'sincronize o transportador antes — reenvio no próximo ciclo' }],
@@ -166,7 +191,7 @@ router.post('/customer/sincronize', async (req: Request, res: Response) => {
     }
 
     await conn.commit()
-    res.json(syncSuccess(entityId, externalCode))
+    res.json(syncSuccess(entityId, externalCode, clearExternalCode))
   } catch (err: any) {
     await conn.rollback()
     if (err instanceof HttpError) {

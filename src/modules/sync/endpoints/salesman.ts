@@ -51,7 +51,7 @@ const salesmanBody = z.object({
  *     tags: [Sincronização]
  *     security: [{ ApiKeyAuth: [] }]
  *     responses:
- *       200: { description: "{ ok, id, externalCode? } — id = entity.id" }
+ *       200: { description: "{ ok, id, externalCode?, clearExternalCode? } — id = entity.id" }
  *       400: { description: Payload inválido }
  *       401: { description: X-Api-Key inválida ou ausente }
  *       404: { description: externalCode desconhecido }
@@ -82,7 +82,8 @@ router.post('/salesman/sincronize', async (req: Request, res: Response) => {
     const { institutionId, schemaName } = req.syncClient!
 
     await conn.beginTransaction()
-    const { entityId, externalCode } = await saveSyncEntity(conn, entityParsed.data)
+    const { entityId, externalCode, clearExternalCode } =
+      await saveSyncEntity(conn, entityParsed.data, { origin: 'salesman', institutionId })
 
     await conn.query(`USE \`${schemaName}\``)
 
@@ -124,7 +125,7 @@ router.post('/salesman/sincronize', async (req: Request, res: Response) => {
     }
 
     await conn.commit()
-    res.json(syncSuccess(entityId, externalCode))
+    res.json(syncSuccess(entityId, externalCode, clearExternalCode))
   } catch (err: any) {
     await conn.rollback()
     if (err instanceof HttpError) {

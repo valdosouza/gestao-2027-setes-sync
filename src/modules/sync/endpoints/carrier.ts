@@ -9,23 +9,26 @@ import logger from '@shared/logger/logger'
 const router = Router()
 
 /**
- * Fornecedor — papel de entidade (Onda 4): cadeia na central pelo motor
- * (reindexação D3/D4) + papel tb_provider no schema do cliente com
- * id = entity.id (D13). Contrato: CONTRATOS_SYNC.md (bloco entity padrão
- * + bloco provider).
+ * Transportadora — papel de entidade (decisão 4 da revisão do processo de
+ * entidades, 2026-07-25): cadeia na central pelo motor (reindexação D3/D4)
+ * + papel tb_carrier no schema do cliente com id = entity.id (D13).
+ * Sem esta rota o /customer com carrierDocument ficava em 409
+ * CARRIER_NOT_SYNCED eterno — a transportadora nunca era enviada.
+ * Contrato: CONTRATOS_SYNC.md (bloco entity padrão + bloco carrier).
  */
-const providerBody = z.object({
+const carrierBody = z.object({
   active: z.enum(['S', 'N']).optional().default('S'),
 })
 
 /**
  * @swagger
- * /provider/sincronize:
+ * /carrier/sincronize:
  *   post:
- *     summary: Sincronizar Fornecedor (cadeia central + papel no schema)
+ *     summary: Sincronizar Transportadora (cadeia central + papel no schema)
  *     description: >-
  *       Bloco entity padrão reindexado por CPF/CNPJ ou externalCode +
- *       bloco provider. Devolve externalCode quando personType='N'.
+ *       bloco carrier. Devolve externalCode quando personType='N'.
+ *       Deve sincronizar ANTES do customer (referência carrierDocument).
  *     tags: [Sincronização]
  *     security: [{ ApiKeyAuth: [] }]
  *     responses:
@@ -35,7 +38,7 @@ const providerBody = z.object({
  *       404: { description: externalCode desconhecido }
  *       500: { description: Erro ao processar }
  */
-router.post('/provider/sincronize', async (req: Request, res: Response) => {
+router.post('/carrier/sincronize', async (req: Request, res: Response) => {
   const conn = await pool.getConnection()
   try {
     const entityParsed = syncEntityBody.safeParse(stripDocumentMasks(req.body))
@@ -43,25 +46,25 @@ router.post('/provider/sincronize', async (req: Request, res: Response) => {
       throw new HttpError(400, 'Payload inválido (bloco entity)',
         entityParsed.error.issues.map(i => ({ field: i.path.join('.'), message: i.message })))
     }
-    const provParsed = providerBody.safeParse(req.body.provider ?? {})
-    if (!provParsed.success) {
-      throw new HttpError(400, 'Payload inválido (bloco provider)',
-        provParsed.error.issues.map(i => ({ field: `provider.${i.path.join('.')}`, message: i.message })))
+    const carrParsed = carrierBody.safeParse(req.body.carrier ?? {})
+    if (!carrParsed.success) {
+      throw new HttpError(400, 'Payload inválido (bloco carrier)',
+        carrParsed.error.issues.map(i => ({ field: `carrier.${i.path.join('.')}`, message: i.message })))
     }
     const deleted: 'S' | 'N' = req.body.deleted === 'S' ? 'S' : 'N'
     const { institutionId, schemaName } = req.syncClient!
 
     await conn.beginTransaction()
     const { entityId, externalCode, clearExternalCode } =
-      await saveSyncEntity(conn, entityParsed.data, { origin: 'provider', institutionId })
+      await saveSyncEntity(conn, entityParsed.data, { origin: 'carrier', institutionId })
 
     await conn.query(`USE \`${schemaName}\``)
     await conn.query(
-      `INSERT INTO tb_provider (id, tb_institution_id, active, deleted, created_at, updated_at)
+      `INSERT INTO tb_carrier (id, tb_institution_id, active, deleted, created_at, updated_at)
        VALUES (?, ?, ?, ?, NOW(), NOW())
        ON DUPLICATE KEY UPDATE
          active = VALUES(active), deleted = VALUES(deleted), updated_at = NOW()`,
-      [entityId, institutionId, provParsed.data.active, deleted]
+      [entityId, institutionId, carrParsed.data.active, deleted]
     )
 
     await conn.commit()
@@ -72,7 +75,7 @@ router.post('/provider/sincronize', async (req: Request, res: Response) => {
       res.status(err.statusCode).json({ ok: false, error: err.message, fields: err.fields, code: err.code })
       return
     }
-    logger.error('Erro em /provider/sincronize', { err, client: req.syncClient })
+    logger.error('Erro em /carrier/sincronize', { err, client: req.syncClient })
     res.status(500).json(syncError(err.message))
   } finally {
     conn.release()
