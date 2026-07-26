@@ -4,6 +4,7 @@ import pool from '@shared/db/connection'
 import { PoolConnection } from 'mysql2/promise'
 import { syncSuccess, syncError } from '../sync.response'
 import { findEntityIdByDocument } from '../sync.entity'
+import { userRefBody, resolveUserId, resolveFallbackUserId } from '../sync.user'
 import { ensureCatalogItem, upsertCatalogLink } from '../sync.catalog'
 import { HttpError } from '@shared/errors/http-error'
 import logger from '@shared/logger/logger'
@@ -20,9 +21,12 @@ const router = Router()
  * id local → 409 PRODUCT_NOT_SYNCED. `items` presente = SNAPSHOT (itens
  * fora da lista viram deleted='S'; kind fixo 'Sale' — padrão DP6). Forma de
  * pagamento da cobrança por DESCRIÇÃO (catálogo central + vínculo).
- * tb_order.tb_user_id é NOT NULL com FK na central: como o sync não tem
- * usuário local, usa o usuário mais antigo do institution
- * (tb_institution_has_user). Transação ÚNICA (pedido + satélites);
+ * AUTOR (prompt_indexacao_usuario_firebird.md): bloco `user` opcional
+ * (userDocument OU userExternalCode) resolve o tb_user_id real via
+ * sync.user (409 USER_NOT_SYNCED); ausente → fallback de transição
+ * (usuário mais antigo do institution — decisão 5). No reenvio COM bloco
+ * o autor é corrigido (tb_user_id entra no upsert — pedidos antigos
+ * gravados com fallback se curam). Transação ÚNICA (pedido + satélites);
  * deleted='S' derruba tb_order e TODOS os satélites (D2).
  * Contrato: CONTRATOS_SYNC.md.
  */
@@ -68,6 +72,7 @@ const orderSaleBody = z.object({
     plots:                  z.string().max(3).optional().nullable(),
     deadline:               z.string().max(255).optional().nullable(),
   }).optional(),
+  user: userRefBody.optional(),
 })
 
 /** Papel precisa existir no schema do cliente (id = entity.id — D13). */
@@ -79,22 +84,6 @@ async function roleExists(
     [entityId, institutionId]
   )
   return rows.length > 0
-}
-
-/** tb_order.tb_user_id NOT NULL + FK central — usuário mais antigo do institution. */
-async function resolveSyncUserId(conn: PoolConnection, institutionId: number): Promise<number> {
-  const [rows] = await conn.query<any[]>(
-    `SELECT MIN(tb_user_id) AS uid FROM setes_central.tb_institution_has_user
-     WHERE tb_institution_id = ? AND deleted = 'N'`,
-    [institutionId]
-  )
-  const uid = rows[0]?.uid
-  if (!uid) {
-    throw new HttpError(409, 'Institution sem usuário para assinar o pedido',
-      [{ field: 'id', message: 'cadastre um usuário do institution antes — reenvio no próximo ciclo' }],
-      'INSTITUTION_USER_NOT_FOUND')
-  }
-  return uid
 }
 
 /**
@@ -170,6 +159,12 @@ async function resolveSyncUserId(conn: PoolConnection, institutionId: number): P
  *                   paymentTypeDescription: { type: string, example: "DINHEIRO" }
  *                   plots: { type: string, maxLength: 3 }
  *                   deadline: { type: string }
+ *               user:
+ *                 type: object
+ *                 description: Autor do pedido — exatamente UM dos campos (ausente = fallback de transição)
+ *                 properties:
+ *                   userDocument: { type: string, example: "52998224725" }
+ *                   userExternalCode: { type: string, format: uuid }
  *     responses:
  *       200: { description: "{ ok, id }" }
  *       400: { description: Payload inválido }
@@ -185,7 +180,7 @@ router.post('/order-sale/sincronize', async (req: Request, res: Response) => {
       throw new HttpError(400, 'Payload inválido',
         parsed.error.issues.map(i => ({ field: i.path.join('.'), message: i.message })))
     }
-    const { id, terminal, deleted, order, sale, items, totalizer, billing } = parsed.data
+    const { id, terminal, deleted, order, sale, items, totalizer, billing, user } = parsed.data
     const { institutionId, schemaName } = req.syncClient!
 
     await conn.beginTransaction()
@@ -211,7 +206,9 @@ router.post('/order-sale/sincronize', async (req: Request, res: Response) => {
       paymentTypeId = pt.id
     }
 
-    const userId = await resolveSyncUserId(conn, institutionId)
+    const userId = user
+      ? await resolveUserId(conn, user, institutionId)
+      : await resolveFallbackUserId(conn, institutionId)
 
     // 3. Schema do cliente — papéis precisam existir (D13)
     await conn.query(`USE \`${schemaName}\``)
@@ -236,8 +233,11 @@ router.post('/order-sale/sincronize', async (req: Request, res: Response) => {
          (id, tb_institution_id, terminal, tb_user_id, dt_record, note, origin, status, deleted, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())
        ON DUPLICATE KEY UPDATE
+         ${user ? 'tb_user_id = VALUES(tb_user_id),' : ''}
          dt_record = VALUES(dt_record), note = VALUES(note), origin = VALUES(origin),
          status = VALUES(status), deleted = VALUES(deleted), updated_at = NOW()`,
+      // tb_user_id só atualiza quando o bloco `user` veio — o fallback de
+      // transição nunca sobrescreve um autor real já gravado (decisão 5).
       [id, institutionId, terminal, userId, order.dtRecord ?? null, order.note ?? null,
        order.origin, order.status ?? null, deleted]
     )

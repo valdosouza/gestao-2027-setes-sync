@@ -3,6 +3,7 @@ import { z } from 'zod'
 import pool from '@shared/db/connection'
 import { syncSuccess, syncError } from '../sync.response'
 import { ensureCatalogItem, upsertCatalogLink } from '../sync.catalog'
+import { userRefBody, resolveUserId } from '../sync.user'
 import { HttpError } from '@shared/errors/http-error'
 import logger from '@shared/logger/logger'
 
@@ -14,7 +15,10 @@ const router = Router()
  * não viajam como eventos; ver semântica no financial.ts) e
  * tb_financial_statement_id_origin sempre NULL no sync. Conta bancária
  * por id local (Onda 4); forma de pagamento por descrição.
- * tb_user_id fica 0 (usuário local do Firebird não viaja).
+ * AUTOR (prompt_indexacao_usuario_firebird.md, decisão 6): bloco `user`
+ * opcional resolve tb_user_id = entity.id do usuário do legado (409
+ * USER_NOT_SYNCED); ausente → 0 sentinela (comportamento anterior).
+ * Reenvio COM bloco corrige o autor.
  * Contrato: CONTRATOS_SYNC.md.
  */
 const statementBody = z.object({
@@ -36,6 +40,7 @@ const statementBody = z.object({
   financialPlansIdCre:    z.number().int().nullable().optional(),
   financialPlansIdDeb:    z.number().int().nullable().optional(),
   deleted:                z.enum(['S', 'N']).optional().default('N'),
+  user:                   userRefBody.optional(),
 })
 
 /**
@@ -46,6 +51,8 @@ const statementBody = z.object({
  *     description: >-
  *       Upsert em tb_financial_statement (id = MVF_CODIGO). Conta bancária
  *       inexistente = 409 BANK_ACCOUNT_NOT_SYNCED. status 'N' (espelho).
+ *       Bloco `user` opcional (userDocument OU userExternalCode) resolve o
+ *       autor (409 USER_NOT_SYNCED); ausente → tb_user_id 0 sentinela.
  *     tags: [Sincronização]
  *     security: [{ ApiKeyAuth: [] }]
  *     responses:
@@ -67,6 +74,9 @@ router.post('/financial-statement/sincronize', async (req: Request, res: Respons
     const { institutionId, schemaName } = req.syncClient!
 
     await conn.beginTransaction()
+
+    // Autor (decisão 6) — resolve na central ANTES do USE
+    const userId = s.user ? await resolveUserId(conn, s.user, institutionId) : 0
 
     let paymentTypeId = 0
     if (s.paymentTypeDescription) {
@@ -99,8 +109,9 @@ router.post('/financial-statement/sincronize', async (req: Request, res: Respons
           settled_code, tb_user_id, future, dt_original, doc_reference, conferred,
           tb_payment_types_id, tb_financial_plans_id_cre, tb_financial_plans_id_deb,
           status, deleted, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, 'N', ?, NOW(), NOW())
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'N', ?, NOW(), NOW())
        ON DUPLICATE KEY UPDATE
+         ${s.user ? 'tb_user_id = VALUES(tb_user_id),' : ''}
          tb_bank_account_id = VALUES(tb_bank_account_id), dt_record = VALUES(dt_record),
          tb_bank_historic_id = VALUES(tb_bank_historic_id),
          credit_value = VALUES(credit_value), debit_value = VALUES(debit_value),
@@ -117,7 +128,7 @@ router.post('/financial-statement/sincronize', async (req: Request, res: Respons
       // de referência sem FK (PADROES_BANCO/migration 012).
       [s.id, institutionId, s.terminal, s.bankAccountId ?? 0, s.dtRecord,
        s.bankHistoricId ?? 0, s.creditValue ?? 0, s.debitValue ?? 0,
-       s.manualHistory ?? null, s.kind ?? null, s.settledCode ?? 0,
+       s.manualHistory ?? null, s.kind ?? null, s.settledCode ?? 0, userId,
        s.future, s.dtOriginal ?? null, s.docReference ?? null, s.conferred,
        paymentTypeId, s.financialPlansIdCre ?? 0, s.financialPlansIdDeb ?? 0,
        s.deleted]

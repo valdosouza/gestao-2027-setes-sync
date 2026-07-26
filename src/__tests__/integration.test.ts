@@ -56,6 +56,16 @@ describe('setes-sync — Integration Tests', () => {
     })
   })
 
+  describe('POST /user/sincronize', () => {
+    it('retorna 401 sem X-Api-Key', async () => {
+      const res = await request(app)
+        .post('/user/sincronize')
+        .send({ personType: 'N', entity: { nameCompany: 'USUARIO TESTE' } })
+
+      expect(res.status).toBe(401)
+    })
+  })
+
   describe('Endpoints Desabilitados (Restaurante)', () => {
     it('POST /rest-group/sincronize não existe', async () => {
       const res = await request(app)

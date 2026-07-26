@@ -1,9 +1,9 @@
 import { Router, Request, Response } from 'express'
 import { z } from 'zod'
 import pool from '@shared/db/connection'
-import { PoolConnection } from 'mysql2/promise'
 import { syncSuccess, syncError } from '../sync.response'
 import { findEntityIdByDocument } from '../sync.entity'
+import { userRefBody, resolveUserId, resolveFallbackUserId } from '../sync.user'
 import { HttpError } from '@shared/errors/http-error'
 import logger from '@shared/logger/logger'
 
@@ -16,9 +16,10 @@ const router = Router()
  * (409 ENTITY_NOT_SYNCED se desconhecido); ausente → 0 (tb_entity_id é
  * NOT NULL sem FK — sentinela "sem entidade"). Produto do item por id
  * local → 409 PRODUCT_NOT_SYNCED. `items` presente = SNAPSHOT (kind fixo
- * 'Adjust'). tb_order.tb_user_id NOT NULL com FK central: usa o usuário
- * mais antigo do institution (tb_institution_has_user). Transação ÚNICA;
- * deleted='S' em cascata (D2). Contrato: CONTRATOS_SYNC.md.
+ * 'Adjust'). AUTOR (prompt_indexacao_usuario_firebird.md): bloco `user`
+ * opcional resolve o tb_user_id real (409 USER_NOT_SYNCED); ausente →
+ * fallback de transição (decisão 5). Reenvio COM bloco corrige o autor.
+ * Transação ÚNICA; deleted='S' em cascata (D2). Contrato: CONTRATOS_SYNC.md.
  */
 const itemBody = z.object({
   id:              z.number().int().positive(),
@@ -45,23 +46,8 @@ const orderStockAdjustBody = z.object({
     direction:      z.string().trim().length(1),
   }),
   items: z.array(itemBody).optional(),
+  user: userRefBody.optional(),
 })
-
-/** tb_order.tb_user_id NOT NULL + FK central — usuário mais antigo do institution. */
-async function resolveSyncUserId(conn: PoolConnection, institutionId: number): Promise<number> {
-  const [rows] = await conn.query<any[]>(
-    `SELECT MIN(tb_user_id) AS uid FROM setes_central.tb_institution_has_user
-     WHERE tb_institution_id = ? AND deleted = 'N'`,
-    [institutionId]
-  )
-  const uid = rows[0]?.uid
-  if (!uid) {
-    throw new HttpError(409, 'Institution sem usuário para assinar o pedido',
-      [{ field: 'id', message: 'cadastre um usuário do institution antes — reenvio no próximo ciclo' }],
-      'INSTITUTION_USER_NOT_FOUND')
-  }
-  return uid
-}
 
 /**
  * @swagger
@@ -101,6 +87,12 @@ async function resolveSyncUserId(conn: PoolConnection, institutionId: number): P
  *                   number: { type: integer }
  *                   entityDocument: { type: string, example: "52998224725" }
  *                   direction: { type: string, maxLength: 1, example: "E" }
+ *               user:
+ *                 type: object
+ *                 description: Autor do ajuste — exatamente UM dos campos (ausente = fallback de transição)
+ *                 properties:
+ *                   userDocument: { type: string, example: "52998224725" }
+ *                   userExternalCode: { type: string, format: uuid }
  *               items:
  *                 type: array
  *                 items:
@@ -128,7 +120,7 @@ router.post('/order-stock-adjust/sincronize', async (req: Request, res: Response
       throw new HttpError(400, 'Payload inválido',
         parsed.error.issues.map(i => ({ field: i.path.join('.'), message: i.message })))
     }
-    const { id, terminal, deleted, order, adjust, items } = parsed.data
+    const { id, terminal, deleted, order, adjust, items, user } = parsed.data
     const { institutionId, schemaName } = req.syncClient!
 
     await conn.beginTransaction()
@@ -145,7 +137,9 @@ router.post('/order-stock-adjust/sincronize', async (req: Request, res: Response
       entityId = found
     }
 
-    const userId = await resolveSyncUserId(conn, institutionId)
+    const userId = user
+      ? await resolveUserId(conn, user, institutionId)
+      : await resolveFallbackUserId(conn, institutionId)
 
     await conn.query(`USE \`${schemaName}\``)
 
@@ -155,8 +149,10 @@ router.post('/order-stock-adjust/sincronize', async (req: Request, res: Response
          (id, tb_institution_id, terminal, tb_user_id, dt_record, note, origin, status, deleted, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())
        ON DUPLICATE KEY UPDATE
+         ${user ? 'tb_user_id = VALUES(tb_user_id),' : ''}
          dt_record = VALUES(dt_record), note = VALUES(note), origin = VALUES(origin),
          status = VALUES(status), deleted = VALUES(deleted), updated_at = NOW()`,
+      // tb_user_id só atualiza quando o bloco `user` veio (decisão 5).
       [id, institutionId, terminal, userId, order.dtRecord ?? null, order.note ?? null,
        order.origin, order.status ?? null, deleted]
     )

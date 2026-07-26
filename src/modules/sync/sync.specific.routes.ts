@@ -29,6 +29,7 @@ import salesmanRouter from './endpoints/salesman'
 import stockbalanceRouter          from './endpoints/stockbalance'
 import stocklistRouter             from './endpoints/stocklist'
 import stockstatementRouter        from './endpoints/stockstatement'
+import userRouter                  from './endpoints/user'
 
 const router = Router()
 
@@ -66,5 +67,6 @@ router.use(salesmanRouter)
 router.use(stockbalanceRouter)
 router.use(stocklistRouter)
 router.use(stockstatementRouter)
+router.use(userRouter)
 
 export default router
