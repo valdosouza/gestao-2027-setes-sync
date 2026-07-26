@@ -1,5 +1,36 @@
 # CLAUDE.md
 
+## ⚠️ REVISÃO EM ANDAMENTO (2026-07-19) — leia PRIMEIRO o prompt da revisão
+
+`Infra-IA/setes-sync/prompt_revisao_sincronizador_setes_sync.md` — prompt FECHADO (24 decisões
+D1–D24) que governa TODA mudança neste projeto. Pontos que SUPERAM o que este arquivo diz abaixo:
+
+- **Auth (D12)**: NÃO existe mais `SYNC_API_KEY` global no `.env`. Uma API key por instalação em
+  `setes_central.tb_sync_api_key` (JOIN `tb_institution` → `institutionId` + `schemaName`).
+  `req.syncClient = { institutionId, establishmentCode, schemaName }` (NUNCA tenantId).
+- **Envelope (D14)**: sucesso `{ok:true, id, externalCode?}` HTTP 200; erro `{ok:false, error}`
+  com HTTP <> 200 (o Delphi detecta pelo status e grava em TB_SINCRONIA.SRC_LOG).
+- **Indexação (D3/D4)**: CPF/CNPJ → entity.id em setes_central; sem documento → UUID em
+  `tb_no_doc` devolvido como `externalCode`. NUNCA usar id do Firebird como entity id.
+- **Gravação (D13)**: cadeia de entidade SEMPRE em `setes_central`; no schema do cliente só o
+  papel (tb_customer/...). Peças copiadas da setes-api (cópia consciente, sem dependência).
+- **Removidos na Onda 1 (D19/D23)**: `sync.queue`/`sync.service`/`sync.repository` (mortos),
+  `gateway/auth.middleware` (chave global) e os 7 endpoints `rest-*`.
+- ⚠️ Endpoints existentes ainda são pré-Fases 2/3 (achados A1–A10 do prompt) — estão sendo
+  reescritos onda a onda; não os use como referência de padrão.
+
+## ⚠️ Base de conhecimento central: D:\Gestao2027\Infra-IA
+
+Antes de qualquer tarefa neste projeto, consulte `D:\Gestao2027\Infra-IA\INDICE_CENTRAL.md`
+(documentação, skills, agentes e decisões arquiteturais vigentes). Em especial:
+- Banco de dados: `Infra-IA/database/PADROES_BANCO.md` + skill `revisar-ddl.md` (obrigatório antes de DDL)
+- Decisões vigentes (Fase 2): `Infra-IA/setes-api/prompt_fase2_gerenciamento_central.md` — JWT usa
+  `institutionId` int (nunca `tenantId`), tabelas `tb_institution`/`tb_feature_flag`/`tb_sync_api_key`,
+  schemas `setes_<nome>`.
+Ao concluir tarefa que gere conhecimento novo, siga `Infra-IA/skills-genericas/atualizar-infra-ia.md`.
+
+
+
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## Quick Commands

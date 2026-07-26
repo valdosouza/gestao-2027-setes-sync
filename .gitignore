@@ -6,3 +6,4 @@ dist/
 .idea/
 .vscode/
 *.swp
+.dev-sync-key
