@@ -4,10 +4,12 @@ import pool from '@shared/db/connection'
 import { syncSuccess, syncError } from '../sync.response'
 import {
   syncEntityBody, saveSyncEntity, stripDocumentMasks, findEntityIdByDocument,
+  getInstitutionDocument, resolveSelfSalesman,
 } from '../sync.entity'
 import { ensureCatalogItem, upsertCatalogLink } from '../sync.catalog'
 import { HttpError } from '@shared/errors/http-error'
 import logger from '@shared/logger/logger'
+import { snFlag } from '@shared/validation'
 
 const router = Router()
 
@@ -48,20 +50,20 @@ const customerBody = z.object({
   creditValue:            z.number().nullable().optional(),
   paymentTypeDescription: z.string().trim().min(1).max(45).optional(),
   multiplier:             z.number().optional().default(1),
-  active:                 z.enum(['S', 'N']).optional().default('S'),
+  active:                 snFlag('S'),
 })
 
 const entityTaxBody = z.object({
-  consumer:               z.enum(['S', 'N']).optional(),
+  consumer:               snFlag(),
   taxRegime:              z.string().max(100).nullable().optional(),
-  byPassSt:               z.enum(['S', 'N']).optional(),
+  byPassSt:               snFlag(),
   indIeDest:              z.string().max(1).nullable().optional(),
   issExigibilidade:       z.string().max(2).nullable().optional(),
   issProcessNr:           z.string().max(25).nullable().optional(),
-  issRetido:              z.enum(['S', 'N']).optional(),
-  issIndIncFiscal:        z.enum(['S', 'N']).optional(),
-  autoSendInvoice:        z.enum(['S', 'N']).optional(),
-  autoSendInvoiceJustXml: z.enum(['S', 'N']).optional(),
+  issRetido:              snFlag(),
+  issIndIncFiscal:        snFlag(),
+  autoSendInvoice:        snFlag(),
+  autoSendInvoiceJustXml: snFlag(),
 })
 
 /**
@@ -118,14 +120,29 @@ router.post('/customer/sincronize', async (req: Request, res: Response) => {
     // 2. Referências por DOCUMENTO (D3) — decisão 4 da revisão de entidades
     //    (2026-07-25): o 409 verifica o PAPEL no schema do cliente, não só a
     //    existência da entity (o mesmo CPF pode existir só como cliente).
+    // Vendedor do cliente: referência OPCIONAL (2026-08-09, Valdo) —
+    // diferente do pedido de venda (que exige vendedor sincronizado), o
+    // cliente NÃO tem obrigatoriedade de carteira com vendedor. Não achou
+    // = grava sem o vínculo (salesmanId null) em vez de 409 pra sempre —
+    // muitos códigos de vendedor no legado não correspondem a nenhum
+    // colaborador real (achado da rodada de 2026-08-09).
     let salesmanId: number | null = null
     if (cust.salesmanDocument) {
-      salesmanId = await findRoleIdByDocument(conn, schemaName, 'tb_salesman',
-        institutionId, cust.salesmanDocument)
-      if (salesmanId === null) {
-        throw new HttpError(409, `Vendedor ${cust.salesmanDocument} ainda não sincronizado`,
-          [{ field: 'customer.salesmanDocument', message: 'sincronize o vendedor antes — reenvio no próximo ciclo' }],
-          'SALESMAN_NOT_SYNCED')
+      // Vendedor = a PRÓPRIA empresa (2026-08-09): ver ordersale.ts — legado
+      // grava o EMP_CODIGO da loja como vendedor de clientes sem
+      // representante; a institution vira seu próprio fallback.
+      const institutionDoc = await getInstitutionDocument(conn, institutionId)
+      if (institutionDoc && institutionDoc === cust.salesmanDocument.replace(/\D/g, '')) {
+        await resolveSelfSalesman(conn, institutionId, schemaName)
+        salesmanId = institutionId
+      } else {
+        salesmanId = await findRoleIdByDocument(conn, schemaName, 'tb_salesman',
+          institutionId, cust.salesmanDocument)
+        if (salesmanId === null) {
+          logger.warn(
+            `Cliente com salesmanDocument sem vendedor sincronizado — gravado sem o vínculo`,
+            { salesmanDocument: cust.salesmanDocument, institutionId })
+        }
       }
     }
     let carrierId: number | null = null

@@ -40,12 +40,30 @@ import {
 // Contrato (D22): bloco `entity` padrão dos endpoints de entidade
 // ---------------------------------------------------------------------
 
-/** Email de contato — grava em tb_mailing (dedupe por UNIQUE) + vínculo. */
-export const syncMailingBody = z.object({
-  email: z.string().trim().toLowerCase().email(),
-  /** Grupo do vínculo: 1=principal (default), 3=nfe. */
-  groupId: z.number().int().optional().default(1),
-})
+/** Email de contato — grava em tb_mailing (dedupe por UNIQUE) + vínculo.
+ *  Email INVÁLIDO do legado = SEM email (2026-08-01, precedente da decisão
+ *  "documento inválido = sem documento"): a entrada vira null no preprocess
+ *  e é filtrada no saveSyncEntity — lixo de cadastro antigo não pode barrar
+ *  o cliente inteiro. */
+const validEmail = z.string().trim().toLowerCase().email()
+
+export const syncMailingBody = z.preprocess(
+  v => {
+    const email = (v as { email?: unknown })?.email
+    // Mesmo validador do schema final — o que não passar ali vira null AQUI
+    // (nunca 400).
+    if (!validEmail.safeParse(email).success) {
+      logger.warn(`Email inválido do legado descartado: ${JSON.stringify(email)}`)
+      return null
+    }
+    return v
+  },
+  z.object({
+    email: validEmail,
+    /** Grupo do vínculo: 1=principal (default), 3=nfe. */
+    groupId: z.number().int().optional().default(1),
+  }).nullable()
+)
 
 /**
  * Bloco de entidade do contrato de sincronização = entityFiscalBody da
@@ -62,7 +80,8 @@ export const syncEntityBody = withFiscalRefinements(
 
 export type SyncEntityInput = EntityFiscalInput & {
   externalCode?: string
-  mailings?:     Array<{ email: string; groupId: number }>
+  // null = email inválido do legado descartado no preprocess (filtrado no save)
+  mailings?:     Array<{ email: string; groupId: number } | null>
 }
 
 export interface SyncEntityResult {
@@ -89,11 +108,19 @@ export interface SyncContext {
 const digitsOnly = (v: string) => v.replace(/\D/g, '')
 
 /** Remove máscara de CPF/CNPJ antes da validação Zod (defensivo — o
- *  contrato D22 pede sem máscara, mas o legado pode escorregar). */
+ *  contrato D22 pede sem máscara, mas o legado pode escorregar).
+ *  2026-08-03: também normaliza nome×fantasia — legado com um dos dois em
+ *  branco (ex.: TB_USUARIO sem apelido) herda o outro em vez de 400. */
 export function stripDocumentMasks<T extends Record<string, any>>(body: T): T {
   const out: any = { ...body }
   if (out.person?.cpf)    out.person  = { ...out.person,  cpf:  digitsOnly(String(out.person.cpf)) }
   if (out.company?.cnpj)  out.company = { ...out.company, cnpj: digitsOnly(String(out.company.cnpj)) }
+  if (out.entity) {
+    const name = String(out.entity.nameCompany ?? '').trim()
+    const nick = String(out.entity.nickTrade ?? '').trim()
+    if (name && !nick)      out.entity = { ...out.entity, nickTrade: name }
+    else if (nick && !name) out.entity = { ...out.entity, nameCompany: nick }
+  }
   return out
 }
 
@@ -224,6 +251,166 @@ async function registerSyncConflict(
   )
 }
 
+// ---------------------------------------------------------------------
+// Papéis-SENTINELA (decisão Valdo — opção b, 2026-08-03): a venda balcão
+// do legado não identifica cliente/vendedor (documento ausente, zerado ou
+// sentinela). O processo resolve para papéis autocriados por institution
+// (precedente da forma "Carteira" autocreate): entity 'N' (sem doc, UUID)
+// em setes_central + papel no schema do cliente. Idempotência pelo NOME +
+// entity sem-documento (tb_no_doc viva) — um cliente real homônimo COM
+// documento nunca é confundido.
+// ---------------------------------------------------------------------
+
+const SENTINEL_NAMES = {
+  customer: 'CONSUMIDOR FINAL',
+  salesman: 'VENDEDOR PADRAO',
+} as const
+
+export async function resolveSentinelRole(
+  conn: PoolConnection, institutionId: number, schemaName: string,
+  role: keyof typeof SENTINEL_NAMES
+): Promise<number> {
+  const name  = SENTINEL_NAMES[role]
+  const table = role === 'customer' ? 'tb_customer' : 'tb_salesman'
+  const [rows] = await conn.query<any[]>(
+    `SELECT p.id FROM \`${schemaName}\`.${table} p
+     JOIN setes_central.tb_entity e ON e.id = p.id
+     JOIN setes_central.tb_no_doc n ON n.id = p.id AND n.deleted = 'N'
+     WHERE p.tb_institution_id = ? AND e.name_company = ?
+     LIMIT 1`,
+    [institutionId, name]
+  )
+  if (rows.length) return rows[0].id
+
+  const { id: entityId } = await saveEntityFiscalChain(conn, null, {
+    entity: { nameCompany: name, nickTrade: name },
+    personType: 'N', person: null, company: null,
+  } as EntityFiscalInput)
+
+  if (role === 'salesman') {
+    await conn.query(
+      `INSERT INTO \`${schemaName}\`.tb_salesman
+         (id, tb_institution_id, active, flex_value, deleted, created_at, updated_at)
+       VALUES (?, ?, 'S', 0, 'N', NOW(), NOW())
+       ON DUPLICATE KEY UPDATE deleted = 'N', updated_at = NOW()`,
+      [entityId, institutionId]
+    )
+  } else {
+    await conn.query(
+      `INSERT INTO \`${schemaName}\`.tb_customer
+         (id, tb_institution_id, active, deleted, created_at, updated_at)
+       VALUES (?, ?, 'S', 'N', NOW(), NOW())
+       ON DUPLICATE KEY UPDATE deleted = 'N', updated_at = NOW()`,
+      [entityId, institutionId]
+    )
+  }
+  logger.warn(
+    `Papel sentinela '${name}' (${role}) criado para institution ${institutionId} — venda sem documento`)
+  return entityId
+}
+
+/** Documento (CNPJ/CPF) do PRÓPRIO institution — mesma herança por PK do
+ *  trio geográfico (tb_institution.id É a tb_entity.id). null = institution
+ *  sem cadeia fiscal própria completa (não deveria acontecer em produção). */
+export async function getInstitutionDocument(
+  conn: PoolConnection, institutionId: number
+): Promise<string | null> {
+  const [company] = await conn.query<any[]>(
+    `SELECT cnpj FROM setes_central.tb_company WHERE id = ? LIMIT 1`, [institutionId])
+  if (company.length) return String(company[0].cnpj)
+  const [person] = await conn.query<any[]>(
+    `SELECT cpf FROM setes_central.tb_person WHERE id = ? LIMIT 1`, [institutionId])
+  return person.length ? String(person[0].cpf) : null
+}
+
+// ---------------------------------------------------------------------
+// Vendedor = a PRÓPRIA empresa (Valdo, 2026-08-09): venda de balcão do
+// legado grava, como código do vendedor, o EMP_CODIGO da própria loja em
+// vez de deixar o campo vazio — "amador" mas já é o comportamento real do
+// legado (achado da investigação do sync-errors.log da Pipoteca, onde
+// ~79% dos pedidos travavam em SALESMAN_NOT_SYNCED exatamente por isso).
+// Em vez de tratar isso como 409 pra sempre (a empresa nunca vai "se
+// sincronizar como vendedor" sozinha por nenhum endpoint /salesman), o
+// institution vira seu PRÓPRIO vendedor-fallback: papel real (não
+// sentinela sem-doc) na entity que já existe (tb_institution.id).
+// Precedência de papéis (2026-07-17): Salesman SEMPRE é Collaborator —
+// os dois papéis nascem juntos com o MESMO id.
+// ---------------------------------------------------------------------
+
+export async function resolveSelfSalesman(
+  conn: PoolConnection, institutionId: number, schemaName: string
+): Promise<void> {
+  await conn.query(
+    `INSERT INTO \`${schemaName}\`.tb_collaborator
+       (id, tb_institution_id, active, deleted, created_at, updated_at)
+     VALUES (?, ?, 'S', 'N', NOW(), NOW())
+     ON DUPLICATE KEY UPDATE deleted = 'N', updated_at = NOW()`,
+    [institutionId, institutionId]
+  )
+  await conn.query(
+    `INSERT INTO \`${schemaName}\`.tb_salesman
+       (id, tb_institution_id, active, flex_value, deleted, created_at, updated_at)
+     VALUES (?, ?, 'S', 0, 'N', NOW(), NOW())
+     ON DUPLICATE KEY UPDATE deleted = 'N', updated_at = NOW()`,
+    [institutionId, institutionId]
+  )
+  logger.warn(
+    `Vendedor-fallback: institution ${institutionId} promovido a colaborador/vendedor de si mesmo ` +
+    `(venda sem vendedor identificado no legado)`)
+}
+
+/** Trio geográfico do endereço do PRÓPRIO institution (herança por PK:
+ *  tb_institution.id É a entity id — endereço main na setes_central). */
+async function getInstitutionGeoTrio(
+  conn: PoolConnection, institutionId: number
+): Promise<{ country: number; state: number; city: number } | null> {
+  const [rows] = await conn.query<any[]>(
+    `SELECT tb_country_id AS country, tb_state_id AS state, tb_city_id AS city
+     FROM setes_central.tb_address
+     WHERE id = ? AND deleted = 'N'
+     ORDER BY (main = 'S') DESC, kind
+     LIMIT 1`,
+    [institutionId]
+  )
+  return rows.length ? rows[0] : null
+}
+
+/**
+ * FALLBACK GEOGRÁFICO (decisão Valdo 2026-08-01, diagnóstico do
+ * sync-errors.log): país/estado/cidade da central são MIGRADOS do Firebird —
+ * um id que não existe é dado sujo do legado e NÃO pode derrubar o cadastro
+ * (a 1ª rodada real estourava a FK de tb_state_id em 500). Endereço com
+ * qualquer id do trio inexistente cai para o trio COMPLETO do próprio
+ * institution (troca parcial criaria cidade de um estado em outro). Sem
+ * endereço no institution, segue o fluxo normal (409 legível do
+ * ensureAddressRefs / cidade placeholder).
+ */
+async function applyGeoFallback(
+  conn: PoolConnection, input: SyncEntityInput, institutionId?: number
+): Promise<void> {
+  if (!institutionId || !input.addresses?.length) return
+  let trio: { country: number; state: number; city: number } | null | undefined
+  for (const a of input.addresses) {
+    const [checks] = await conn.query<any[]>(
+      `SELECT
+         (SELECT COUNT(*) FROM setes_central.tb_country WHERE id = ?) AS country,
+         (SELECT COUNT(*) FROM setes_central.tb_state   WHERE id = ?) AS state,
+         (SELECT COUNT(*) FROM setes_central.tb_city    WHERE id = ?) AS city`,
+      [a.tbCountryId, a.tbStateId, a.tbCityId]
+    )
+    if (checks[0].country && checks[0].state && checks[0].city) continue
+    if (trio === undefined) trio = await getInstitutionGeoTrio(conn, institutionId)
+    if (!trio) return
+    logger.warn(
+      `Geo inexistente no endereço kind='${a.kind}' (país ${a.tbCountryId}/UF ` +
+      `${a.tbStateId}/cidade ${a.tbCityId}) — fallback para o trio do institution ${institutionId}`
+    )
+    a.tbCountryId = trio.country
+    a.tbStateId   = trio.state
+    a.tbCityId    = trio.city
+  }
+}
+
 /**
  * Salva/reindexa a entidade do pacote DENTRO da transação do endpoint.
  * O chamador grava o papel (tb_customer/...) no schema do cliente com o
@@ -235,6 +422,8 @@ export async function saveSyncEntity(
   let entityId: number
   let reused: boolean
   let clearExternalCode: boolean | undefined
+
+  await applyGeoFallback(conn, input, ctx?.institutionId)
 
   const doc = input.personType === 'F' ? input.person?.cpf
             : input.personType === 'J' ? input.company?.cnpj
@@ -311,8 +500,12 @@ export async function saveSyncEntity(
     reused   = result.reused
   }
 
-  if (input.mailings !== undefined && input.mailings.length > 0) {
-    await syncMailings(conn, entityId, input.mailings)
+  // Entradas null = email inválido do legado descartado no preprocess
+  const validMailings = (input.mailings ?? []).filter(
+    (m): m is { email: string; groupId: number } => m !== null
+  )
+  if (validMailings.length > 0) {
+    await syncMailings(conn, entityId, validMailings)
   }
 
   const externalCode =

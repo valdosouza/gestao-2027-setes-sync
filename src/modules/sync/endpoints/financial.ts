@@ -24,10 +24,18 @@ const router = Router()
 const financialBody = z.object({
   orderId:                z.number().int().positive(),
   terminal:               z.number().int().min(0),
-  parcel:                 z.number().int().positive(),
+  // Espelho: parcela 0 = título de parcela única no legado (2026-08-02);
+  // 0 é válido na PK natural (institution, order, terminal, parcel)
+  parcel:                 z.number().int().nonnegative(),
   dtExpiration:           z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
   tagValue:               z.number(),
   paymentTypeDescription: z.string().trim().min(1).max(45).optional(),
+  // Bills no espelho (decisões D1/D3 do Valdo, 2026-08-03): kind =
+  // TB_FINANCEIRO.FIN_TIPO cru (1ª letra R/P define receber×pagar);
+  // number = FIN_NUMERO (nº do documento). Opcionais: payload pré-patch
+  // cai no fallback (direção pelo pedido; number = orderId-parcela).
+  kind:                   z.string().trim().max(2).optional(),
+  number:                 z.string().trim().max(60).optional(),
   deleted:                z.enum(['S', 'N']).optional().default('N'),
   payment: z.object({
     paidValue:        z.number(),
@@ -90,9 +98,19 @@ router.post('/financial/sincronize', async (req: Request, res: Response) => {
       [f.orderId, institutionId]
     )
     if (!orders.length) {
-      throw new HttpError(409, `Pedido ${f.orderId} ainda não sincronizado`,
-        [{ field: 'orderId', message: 'sincronize o pedido antes — reenvio no próximo ciclo' }],
-        'ORDER_NOT_SYNCED')
+      // Nota AVULSA (2026-08-09, NFL_TIPO='EM'): não tem tb_order — só as
+      // notas de PROCESSO (venda/compra/serviço/ajuste) criam pedido+nota na
+      // mesma transação (D9). A avulsa só tem tb_invoice, mas isso já basta
+      // pra identificar "a nota existe" pro financeiro dela.
+      const [invoices] = await conn.query<any[]>(
+        `SELECT id FROM tb_invoice WHERE id = ? AND tb_institution_id = ? AND terminal = ? LIMIT 1`,
+        [f.orderId, institutionId, f.terminal]
+      )
+      if (!invoices.length) {
+        throw new HttpError(409, `Pedido ${f.orderId} ainda não sincronizado`,
+          [{ field: 'orderId', message: 'sincronize o pedido antes — reenvio no próximo ciclo' }],
+          'ORDER_NOT_SYNCED')
+      }
     }
 
     if (f.payment?.financialPlansId) {
@@ -118,6 +136,43 @@ router.post('/financial/sincronize', async (req: Request, res: Response) => {
          tag_value = VALUES(tag_value), deleted = VALUES(deleted), updated_at = NOW()`,
       [institutionId, f.orderId, f.terminal, f.parcel, f.dtExpiration,
        paymentTypeId, f.tagValue, f.deleted]
+    )
+
+    // Bill 1:1 com o título (decisões do Valdo 2026-08-03, revisada no mesmo
+    // dia): sem ela o título é INVISÍVEL ao módulo de baixas da web (INNER
+    // JOIN). ESPELHO FIEL: kind = FIN_TIPO COMO ESTÁ (RA/RM/PA/PM — a rotina
+    // de parcerias do settlements só dispara em baixa FEITA PELA WEB e é
+    // guiada por dados: sem parceria cadastrada, no-op); direção (operation
+    // C/D) pela 1ª letra. Payload sem kind (pré-patch Delphi) → fallback
+    // pelo pedido, gravado como RM/PM (manual) e corrigido no reenvio
+    // pós-compilação. Estado pago×aberto NÃO vive na bill (deriva dos
+    // payments) — situation/stage 'N' como no faturamento de OS.
+    let billKind = String(f.kind ?? '').trim().toUpperCase()
+    let direction = billKind.charAt(0)
+    if (direction !== 'R' && direction !== 'P') {
+      const [purch] = await conn.query<any[]>(
+        `SELECT id FROM tb_order_purchase
+         WHERE id = ? AND tb_institution_id = ? AND terminal = ? LIMIT 1`,
+        [f.orderId, institutionId, f.terminal]
+      )
+      direction = purch.length ? 'P' : 'R'
+      billKind = direction === 'R' ? 'RM' : 'PM'
+    }
+    await conn.query(
+      `INSERT INTO tb_financial_bills
+         (tb_institution_id, tb_order_id, terminal, parcel,
+          tb_financial_plans_id, number, kind, situation, operation, stage,
+          created_at, updated_at, deleted)
+       VALUES (?, ?, ?, ?, 0, ?, ?, 'N', ?, 'N', NOW(), NOW(), ?)
+       ON DUPLICATE KEY UPDATE
+         number = VALUES(number), kind = VALUES(kind),
+         operation = VALUES(operation), deleted = VALUES(deleted),
+         updated_at = NOW()`,
+      [institutionId, f.orderId, f.terminal, f.parcel,
+       f.number?.trim() || `${f.orderId}-${f.parcel}`,
+       billKind,
+       direction === 'R' ? 'C' : 'D',
+       f.deleted]
     )
 
     // Baixa espelhada — evento 1, status 'N' (ver comentário do arquivo)

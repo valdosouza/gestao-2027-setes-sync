@@ -3,11 +3,11 @@ import { z } from 'zod'
 import pool from '@shared/db/connection'
 import { PoolConnection } from 'mysql2/promise'
 import { syncSuccess, syncError } from '../sync.response'
-import { findEntityIdByDocument, resolveSentinelRole, getInstitutionDocument, resolveSelfSalesman } from '../sync.entity'
-import { isValidCpf, isValidCnpj } from '@shared/validation'
+import { findEntityIdByDocument, getInstitutionDocument, resolveSelfSalesman } from '../sync.entity'
 import { userRefBody, resolveUserId, resolveFallbackUserId } from '../sync.user'
 import { ensureCatalogItem, upsertCatalogLink } from '../sync.catalog'
 import { invoiceProcessBlock, resolveInvoiceRefs, upsertInvoice, InvoiceRefs } from './invoice'
+import { serviceRamoBlock, upsertServiceRamo } from './invoiceservice'
 import { merchandiseRamoBlock, upsertMerchandiseRamo } from './invoicemerchandise'
 import { HttpError } from '@shared/errors/http-error'
 import logger from '@shared/logger/logger'
@@ -15,43 +15,22 @@ import logger from '@shared/logger/logger'
 const router = Router()
 
 /**
- * Pedido de VENDA — 1º movimento da revisão (Onda 5). ID LOCAL ✅
- * (MAPA_INDEXACAO): o id na web é o NFL_CODIGO da nota do pedido (D1 do
- * prompt_notas_mercadoria_servico.md — a nota mista vincula TODO o processo;
- * tb_order.id = tb_invoice.id = orderId do financeiro). PEDIDO CONJUGADO:
- * este endpoint e o /order-service alimentam o MESMO tb_order — snapshot de
- * itens ESCOPADO por kind='Sale' (nunca toca itens 'Service'). PK
- * id+institution+terminal — `terminal` é dimensão de TODAS as PKs do pedido
- * e vem do payload. Referências de entidade por DOCUMENTO (D3): customerDocument →
- * tb_customer e salesmanDocument → tb_salesman (papel PRECISA existir no
- * schema → 409 *_NOT_SYNCED, reenvio no próximo ciclo). Produto do item por
- * id local → 409 PRODUCT_NOT_SYNCED. `items` presente = SNAPSHOT (itens
- * fora da lista viram deleted='S'; kind fixo 'Sale' — padrão DP6). Forma de
- * pagamento da cobrança por DESCRIÇÃO (catálogo central + vínculo).
- * AUTOR (prompt_indexacao_usuario_firebird.md): bloco `user` opcional
- * (userDocument OU userExternalCode) resolve o tb_user_id real via
- * sync.user (409 USER_NOT_SYNCED); ausente → fallback de transição
- * (usuário mais antigo do institution — decisão 5). No reenvio COM bloco
- * o autor é corrigido (tb_user_id entra no upsert — pedidos antigos
- * gravados com fallback se curam). Transação ÚNICA (pedido + satélites);
- * deleted='S' derruba tb_order e TODOS os satélites (D2).
+ * ORDEM DE SERVIÇO COMPLETA — decisões D1/D6/D9/D13 do
+ * prompt_notas_mercadoria_servico.md. id = NFL_CODIGO (D1: a nota mista
+ * vincula TODO o processo — mesma identidade do módulo nativo Software
+ * House). RODADA 3 (D13): a ordem CONJUGADA entra INTEIRA por aqui — quando
+ * o pedido tem itens de mercadoria, os blocos `sale` (vendedor) e
+ * `saleItems` (itens kind 'Sale' + item_merchandise) viajam junto, e o
+ * `invoice.merchandise` grava o segundo ramo da nota; o /order-sale fica
+ * para vendas PURAS (sem itens de serviço — filtros DISJUNTOS no Delphi).
+ * Snapshots ESCOPADOS por kind ('Service' e 'Sale' separados).
+ * Totalizer/billing são ÚNICOS do pedido ("listas separadas, totalizadas
+ * juntas"). Cliente por DOCUMENTO (D3) com papel verificado; o ramo
+ * tb_order_service não tem vendedor (number + tb_customer_id; open_lock
+ * NULL — a UNIQUE da tela de processo aceita N nulls). AUTOR via bloco
+ * `user`. deleted='S' = pedido inteiro: derruba TODOS os ramos e itens.
  * Contrato: CONTRATOS_SYNC.md.
  */
-/**
- * Documento de REFERÊNCIA tolerante (decisão Valdo — opção b, 2026-08-03):
- * ausente, zerado ou inválido (venda balcão do legado) vira undefined e o
- * processo resolve para o papel-SENTINELA (resolveSentinelRole). Válido é
- * normalizado sem máscara.
- */
-const refDocument = z.preprocess(
-  v => {
-    if (typeof v !== 'string') return v
-    const digits = v.replace(/\D/g, '')
-    return isValidCpf(digits) || isValidCnpj(digits) ? digits : undefined
-  },
-  z.string().min(11).max(18).optional()
-)
-
 const itemBody = z.object({
   id:              z.number().int().positive(),
   productId:       z.number().int().positive(),
@@ -59,11 +38,15 @@ const itemBody = z.object({
   unitValue:       z.number(),
   discountAliquot: z.number().optional().nullable(),
   discountValue:   z.number().optional().nullable(),
-  stockListId:     z.number().int().positive().optional().nullable(),
-  priceListId:     z.number().int().positive().optional().nullable(),
 })
 
-const orderSaleBody = z.object({
+// Itens de MERCADORIA da ordem conjugada (D13) — mesmos campos do /order-sale
+const saleItemBody = itemBody.extend({
+  stockListId: z.number().int().positive().optional().nullable(),
+  priceListId: z.number().int().positive().optional().nullable(),
+})
+
+const orderServiceBody = z.object({
   id:       z.number().int().positive(),
   terminal: z.number().int().min(0),
   deleted:  z.enum(['S', 'N']).optional().default('N'),
@@ -73,12 +56,19 @@ const orderSaleBody = z.object({
     status:   z.string().max(1).optional().nullable(),
     origin:   z.string().max(1).optional().default('D'),
   }).optional().default({}),
-  sale: z.object({
+  service: z.object({
     number:           z.number().int().optional().nullable(),
-    customerDocument: refDocument,
-    salesmanDocument: refDocument,
+    customerDocument: z.string().trim().min(11).max(18),
   }),
   items: z.array(itemBody).optional(),
+  // Rodada 3 (D13): ordem de serviço CONJUGADA entra INTEIRA por aqui — o ramo
+  // de venda viaja junto quando o pedido tem itens de mercadoria.
+  sale: z.object({
+    number:           z.number().int().optional().nullable(),
+    customerDocument: z.string().trim().min(11).max(18).optional(),  // ausente = o do service
+    salesmanDocument: z.string().trim().min(11).max(18),
+  }).optional(),
+  saleItems: z.array(saleItemBody).optional(),
   totalizer: z.object({
     itemsQtde:       z.number().int(),
     productQtde:     z.number().optional().nullable(),
@@ -96,9 +86,11 @@ const orderSaleBody = z.object({
   }).optional(),
   user: userRefBody.optional(),
   // Rodada 2 (D9/D10): objeto COMPLETO — a nota viaja junto do pedido e é
-  // gravada na MESMA transação (mata o 409 ORDER_NOT_SYNCED por construção).
+  // gravada na MESMA transação (ramo tb_invoice_service; na conjugada, o
+  // ramo merchandise vem junto — presença = tem parte mercadoria, D13).
   invoice: invoiceProcessBlock.extend({
-    merchandise: merchandiseRamoBlock.optional().default({}),
+    service:     serviceRamoBlock.optional().default({}),
+    merchandise: merchandiseRamoBlock.optional(),
   }).optional(),
 })
 
@@ -115,17 +107,17 @@ async function roleExists(
 
 /**
  * @swagger
- * /order-sale/sincronize:
+ * /order-service/sincronize:
  *   post:
- *     summary: Sincronizar Pedido de Venda (id local + satélites em transação)
+ *     summary: Sincronizar Pedido de Serviço (ramo tb_order_service, id = NFL_CODIGO)
  *     description: >-
- *       Upsert de tb_order + tb_order_sale + tb_order_item (kind 'Sale') +
- *       tb_order_item_merchandise + tb_order_totalizer + tb_order_billing com
- *       id = PED_CODIGO e `terminal` do payload (dimensão das PKs).
- *       Cliente/vendedor por DOCUMENTO (409 CUSTOMER_NOT_SYNCED /
- *       SALESMAN_NOT_SYNCED); produto por id local (409 PRODUCT_NOT_SYNCED);
- *       forma de pagamento da cobrança por descrição (catálogo central).
- *       `items` presente = snapshot. deleted='S' = soft delete em cascata.
+ *       Upsert de tb_order + tb_order_service + tb_order_item (kind 'Service')
+ *       + tb_order_totalizer + tb_order_billing. Pedido CONJUGADO = mesmo id
+ *       do /order-sale, cada endpoint alimenta seu ramo; snapshot de itens
+ *       escopado por kind='Service'. Cliente por DOCUMENTO (409
+ *       CUSTOMER_NOT_SYNCED); produto por id local (409 PRODUCT_NOT_SYNCED);
+ *       autor via bloco user (409 USER_NOT_SYNCED). deleted='S' = soft delete
+ *       do ramo + itens Service + totalizer/billing.
  *     tags: [Sincronização]
  *     security: [{ ApiKeyAuth: [] }]
  *     requestBody:
@@ -134,25 +126,24 @@ async function roleExists(
  *         application/json:
  *           schema:
  *             type: object
- *             required: [id, terminal, sale]
+ *             required: [id, terminal, service]
  *             properties:
- *               id: { type: integer, example: 1001 }
+ *               id: { type: integer, example: 1001, description: NFL_CODIGO (D1 — vincula todo o processo) }
  *               terminal: { type: integer, example: 0 }
  *               deleted: { type: string, enum: [S, N] }
  *               order:
  *                 type: object
  *                 properties:
- *                   dtRecord: { type: string, example: "2026-07-19" }
+ *                   dtRecord: { type: string, example: "2026-07-26" }
  *                   note: { type: string }
  *                   status: { type: string, maxLength: 1 }
  *                   origin: { type: string, maxLength: 1, example: "D" }
- *               sale:
+ *               service:
  *                 type: object
- *                 required: [customerDocument, salesmanDocument]
+ *                 required: [customerDocument]
  *                 properties:
- *                   number: { type: integer }
+ *                   number: { type: integer, example: 55 }
  *                   customerDocument: { type: string, example: "52998224725" }
- *                   salesmanDocument: { type: string, example: "11222333000181" }
  *               items:
  *                 type: array
  *                 items:
@@ -160,25 +151,23 @@ async function roleExists(
  *                   required: [id, productId, quantity, unitValue]
  *                   properties:
  *                     id: { type: integer, example: 1 }
- *                     productId: { type: integer, example: 501 }
- *                     quantity: { type: number, example: 2 }
- *                     unitValue: { type: number, example: 9.9 }
+ *                     productId: { type: integer, example: 501, description: produto kind='S' }
+ *                     quantity: { type: number, example: 1 }
+ *                     unitValue: { type: number, example: 80 }
  *                     discountAliquot: { type: number }
  *                     discountValue: { type: number }
- *                     stockListId: { type: integer }
- *                     priceListId: { type: integer }
  *               totalizer:
  *                 type: object
  *                 required: [itemsQtde]
  *                 properties:
- *                   itemsQtde: { type: integer, example: 1 }
+ *                   itemsQtde: { type: integer, example: 2 }
  *                   productQtde: { type: number }
  *                   productValue: { type: number }
  *                   ipiValue: { type: number }
  *                   discountAliquot: { type: number }
  *                   discountValue: { type: number }
  *                   expensesValue: { type: number }
- *                   totalValue: { type: number, example: 19.8 }
+ *                   totalValue: { type: number, example: 99.8 }
  *               billing:
  *                 type: object
  *                 required: [paymentTypeDescription]
@@ -192,25 +181,48 @@ async function roleExists(
  *                 properties:
  *                   userDocument: { type: string, example: "52998224725" }
  *                   userExternalCode: { type: string, format: uuid }
+ *               sale:
+ *                 type: object
+ *                 description: Conjugada (D13) — ramo de VENDA do mesmo pedido (vendedor obrigatório; customerDocument ausente = o do service)
+ *                 required: [salesmanDocument]
+ *                 properties:
+ *                   number: { type: integer, example: 55 }
+ *                   customerDocument: { type: string }
+ *                   salesmanDocument: { type: string, example: "52998224725" }
+ *               saleItems:
+ *                 type: array
+ *                 description: Conjugada (D13) — itens de MERCADORIA (kind 'Sale'; mesmos campos dos items do /order-sale, com stockListId/priceListId)
+ *                 items:
+ *                   type: object
+ *                   required: [id, productId, quantity, unitValue]
+ *                   properties:
+ *                     id: { type: integer, example: 1 }
+ *                     productId: { type: integer, example: 501 }
+ *                     quantity: { type: number, example: 2 }
+ *                     unitValue: { type: number, example: 9.9 }
+ *                     stockListId: { type: integer }
+ *                     priceListId: { type: integer }
  *               invoice:
  *                 type: object
  *                 description: >-
  *                   Objeto COMPLETO (rodada 2 D9/D10) — a nota do processo, gravada na
- *                   mesma transação (campos do /invoice sem id/terminal/deleted, que
- *                   vêm da raiz) + bloco merchandise (ramo tb_invoice_merchandise).
+ *                   mesma transação (campos do /invoice sem id/terminal/deleted) +
+ *                   ramo service; na conjugada (D13), o ramo merchandise vem junto
+ *                   (presença = a nota também é de mercadoria).
  *                 properties:
  *                   kindEmis: { type: string, example: "SE" }
  *                   number: { type: string, example: "000124" }
- *                   serie: { type: string, example: "1" }
- *                   cfopId: { type: string, example: "5102" }
  *                   entityDocument: { type: string, example: "52998224725" }
  *                   dtEmission: { type: string, example: "2026-07-27" }
  *                   value: { type: number, example: 99.8 }
- *                   model: { type: string, example: "55" }
  *                   status: { type: string, example: "A" }
+ *                   service:
+ *                     type: object
+ *                     properties:
+ *                       totalValue: { type: number, example: 80, description: NFL_VL_TL_SRV }
  *                   merchandise:
  *                     type: object
- *                     description: Ramo de mercadoria (mesmos campos do /invoice-merchandise)
+ *                     description: Ramo de mercadoria da nota conjugada (mesmos campos do /invoice-merchandise)
  *     responses:
  *       200: { description: "{ ok, id }" }
  *       400: { description: Payload inválido }
@@ -218,15 +230,16 @@ async function roleExists(
  *       409: { description: Referência ainda não sincronizada — reenviar }
  *       500: { description: Erro ao processar }
  */
-router.post('/order-sale/sincronize', async (req: Request, res: Response) => {
+router.post('/order-service/sincronize', async (req: Request, res: Response) => {
   const conn = await pool.getConnection()
   try {
-    const parsed = orderSaleBody.safeParse(req.body)
+    const parsed = orderServiceBody.safeParse(req.body)
     if (!parsed.success) {
       throw new HttpError(400, 'Payload inválido',
         parsed.error.issues.map(i => ({ field: i.path.join('.'), message: i.message })))
     }
-    const { id, terminal, deleted, order, sale, items, totalizer, billing, user, invoice } = parsed.data
+    const { id, terminal, deleted, order, service, items, totalizer, billing, user, invoice,
+            sale, saleItems } = parsed.data
     const { institutionId, schemaName } = req.syncClient!
 
     await conn.beginTransaction()
@@ -237,27 +250,22 @@ router.post('/order-sale/sincronize', async (req: Request, res: Response) => {
       invoiceRefs = await resolveInvoiceRefs(conn, { ...invoice, id, terminal, deleted })
     }
 
-    // 1. Referências por DOCUMENTO (D3) — resolvem na CENTRAL
-    // Opção b (2026-08-03): documento ausente/inválido = venda balcão →
-    // papel-SENTINELA por institution (CONSUMIDOR FINAL / VENDEDOR PADRAO).
-    let customerId: number
-    if (sale.customerDocument) {
-      const found = await findEntityIdByDocument(conn, sale.customerDocument)
-      if (found === null) {
-        throw new HttpError(409, `Cliente ${sale.customerDocument} ainda não sincronizado`,
-          [{ field: 'sale.customerDocument', message: 'sincronize o cliente antes — reenvio no próximo ciclo' }],
-          'CUSTOMER_NOT_SYNCED')
-      }
-      customerId = found
-    } else {
-      customerId = await resolveSentinelRole(conn, institutionId, schemaName, 'customer')
+    // 1. Cliente por DOCUMENTO (D3) — resolve na CENTRAL
+    const customerId = await findEntityIdByDocument(conn, service.customerDocument)
+    if (customerId === null) {
+      throw new HttpError(409, `Cliente ${service.customerDocument} ainda não sincronizado`,
+        [{ field: 'service.customerDocument', message: 'sincronize o cliente antes — reenvio no próximo ciclo' }],
+        'CUSTOMER_NOT_SYNCED')
     }
-    let salesmanId: number
+
+    // 1b. Conjugada (D13): vendedor do ramo de venda, quando o bloco `sale` veio
+    let salesmanId: number | null = null
     let isSelfSalesman = false
-    if (sale.salesmanDocument) {
-      // Vendedor = a PRÓPRIA empresa (2026-08-09): legado grava o EMP_CODIGO
-      // da loja como vendedor em venda de balcão sem representante — a
-      // institution vira seu próprio fallback (papel real, não sentinela).
+    let saleCustomerId = customerId
+    if (sale) {
+      // Vendedor = a PRÓPRIA empresa (2026-08-09): ver ordersale.ts — legado
+      // grava o EMP_CODIGO da loja como vendedor em venda de balcão sem
+      // representante; a institution vira seu próprio fallback.
       const institutionDoc = await getInstitutionDocument(conn, institutionId)
       if (institutionDoc && institutionDoc === sale.salesmanDocument.replace(/\D/g, '')) {
         await resolveSelfSalesman(conn, institutionId, schemaName)
@@ -272,9 +280,15 @@ router.post('/order-sale/sincronize', async (req: Request, res: Response) => {
         }
         salesmanId = found
       }
-    }
-    else {
-      salesmanId = await resolveSentinelRole(conn, institutionId, schemaName, 'salesman')
+      if (sale.customerDocument && sale.customerDocument !== service.customerDocument) {
+        const saleCust = await findEntityIdByDocument(conn, sale.customerDocument)
+        if (saleCust === null) {
+          throw new HttpError(409, `Cliente ${sale.customerDocument} ainda não sincronizado`,
+            [{ field: 'sale.customerDocument', message: 'sincronize o cliente antes — reenvio no próximo ciclo' }],
+            'CUSTOMER_NOT_SYNCED')
+        }
+        saleCustomerId = saleCust
+      }
     }
 
     // 2. Forma de pagamento por DESCRIÇÃO (catálogo central)
@@ -288,15 +302,14 @@ router.post('/order-sale/sincronize', async (req: Request, res: Response) => {
       ? await resolveUserId(conn, user, institutionId)
       : await resolveFallbackUserId(conn, institutionId)
 
-    // 3. Schema do cliente — papéis precisam existir (D13). Sentinelas já
-    // nascem com o papel criado (resolveSentinelRole).
+    // 3. Schema do cliente — papéis precisam existir (D13 da revisão)
     await conn.query(`USE \`${schemaName}\``)
-    if (sale.customerDocument && !await roleExists(conn, 'tb_customer', customerId, institutionId)) {
-      throw new HttpError(409, `Cliente ${sale.customerDocument} ainda não sincronizado`,
-        [{ field: 'sale.customerDocument', message: 'sincronize o cliente antes — reenvio no próximo ciclo' }],
+    if (!await roleExists(conn, 'tb_customer', customerId, institutionId)) {
+      throw new HttpError(409, `Cliente ${service.customerDocument} ainda não sincronizado`,
+        [{ field: 'service.customerDocument', message: 'sincronize o cliente antes — reenvio no próximo ciclo' }],
         'CUSTOMER_NOT_SYNCED')
     }
-    if (sale.salesmanDocument && !isSelfSalesman && !await roleExists(conn, 'tb_salesman', salesmanId, institutionId)) {
+    if (sale && salesmanId !== null && !isSelfSalesman && !await roleExists(conn, 'tb_salesman', salesmanId, institutionId)) {
       throw new HttpError(409, `Vendedor ${sale.salesmanDocument} ainda não sincronizado`,
         [{ field: 'sale.salesmanDocument', message: 'sincronize o vendedor antes — reenvio no próximo ciclo' }],
         'SALESMAN_NOT_SYNCED')
@@ -306,7 +319,7 @@ router.post('/order-sale/sincronize', async (req: Request, res: Response) => {
         institutionId, paymentTypeId)
     }
 
-    // 4. tb_order (backbone)
+    // 4. tb_order (backbone — mesmo upsert do /order-sale, idempotente no conjugado)
     await conn.query(
       `INSERT INTO tb_order
          (id, tb_institution_id, terminal, tb_user_id, dt_record, note, origin, status, deleted, created_at, updated_at)
@@ -316,37 +329,50 @@ router.post('/order-sale/sincronize', async (req: Request, res: Response) => {
          dt_record = VALUES(dt_record), note = VALUES(note), origin = VALUES(origin),
          status = VALUES(status), deleted = VALUES(deleted), updated_at = NOW()`,
       // tb_user_id só atualiza quando o bloco `user` veio — o fallback de
-      // transição nunca sobrescreve um autor real já gravado (decisão 5).
+      // transição nunca sobrescreve um autor real já gravado.
       [id, institutionId, terminal, userId, order.dtRecord ?? null, order.note ?? null,
        order.origin, order.status ?? null, deleted]
     )
 
-    // 5. tb_order_sale (PK inclui tb_salesman_id — troca de vendedor desativa a linha antiga)
+    // 5. tb_order_service (ramo — open_lock NULL: pedido do sync já nasce fechado)
     await conn.query(
-      `INSERT INTO tb_order_sale
-         (id, tb_institution_id, terminal, tb_salesman_id, number, tb_customer_id, deleted, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, NOW(), NOW())
+      `INSERT INTO tb_order_service
+         (id, tb_institution_id, terminal, number, tb_customer_id, open_lock, deleted, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, NULL, ?, NOW(), NOW())
        ON DUPLICATE KEY UPDATE
          number = VALUES(number), tb_customer_id = VALUES(tb_customer_id),
          deleted = VALUES(deleted), updated_at = NOW()`,
-      [id, institutionId, terminal, salesmanId, sale.number ?? null, customerId, deleted]
-    )
-    await conn.query(
-      `UPDATE tb_order_sale SET deleted = 'S', updated_at = NOW()
-       WHERE id = ? AND tb_institution_id = ? AND terminal = ? AND tb_salesman_id <> ? AND deleted = 'N'`,
-      [id, institutionId, terminal, salesmanId]
+      [id, institutionId, terminal, service.number ?? null, customerId, deleted]
     )
 
-    // 6. Itens — SNAPSHOT quando o bloco vem (kind 'Sale' — DP6)
-    if (items) {
-      for (const item of items) {
+    // 5b. Conjugada (D13): ramo de VENDA no MESMO order, quando o pedido tem parte mercadoria
+    if (sale && salesmanId !== null) {
+      await conn.query(
+        `INSERT INTO tb_order_sale
+           (id, tb_institution_id, terminal, tb_salesman_id, number, tb_customer_id, deleted, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, NOW(), NOW())
+         ON DUPLICATE KEY UPDATE
+           number = VALUES(number), tb_customer_id = VALUES(tb_customer_id),
+           deleted = VALUES(deleted), updated_at = NOW()`,
+        [id, institutionId, terminal, salesmanId, sale.number ?? null, saleCustomerId, deleted]
+      )
+      await conn.query(
+        `UPDATE tb_order_sale SET deleted = 'S', updated_at = NOW()
+         WHERE id = ? AND tb_institution_id = ? AND terminal = ? AND tb_salesman_id <> ? AND deleted = 'N'`,
+        [id, institutionId, terminal, salesmanId]
+      )
+    }
+
+    // 5c. Itens de MERCADORIA da conjugada — SNAPSHOT ESCOPADO por kind='Sale'
+    if (saleItems) {
+      for (const item of saleItems) {
         const [products] = await conn.query<any[]>(
           `SELECT id FROM tb_product WHERE id = ? AND tb_institution_id = ? LIMIT 1`,
           [item.productId, institutionId]
         )
         if (!products.length) {
           throw new HttpError(409, `Produto ${item.productId} ainda não sincronizado`,
-            [{ field: 'items.productId', message: 'sincronize o produto antes — reenvio no próximo ciclo' }],
+            [{ field: 'saleItems.productId', message: 'sincronize o produto antes — reenvio no próximo ciclo' }],
             'PRODUCT_NOT_SYNCED')
         }
         await conn.query(
@@ -373,15 +399,14 @@ router.post('/order-sale/sincronize', async (req: Request, res: Response) => {
           )
         }
       }
-      // Snapshot: itens fora da lista saem do pedido (soft delete)
-      const keptIds = items.map(i => i.id)
+      const keptSaleIds = saleItems.map(i => i.id)
       await conn.query(
         `UPDATE tb_order_item SET deleted = 'S', updated_at = NOW()
          WHERE tb_order_id = ? AND tb_institution_id = ? AND terminal = ? AND kind = 'Sale'
-           AND deleted = 'N'${keptIds.length ? ' AND id NOT IN (?)' : ''}`,
-        keptIds.length ? [id, institutionId, terminal, keptIds] : [id, institutionId, terminal]
+           AND deleted = 'N'${keptSaleIds.length ? ' AND id NOT IN (?)' : ''}`,
+        keptSaleIds.length ? [id, institutionId, terminal, keptSaleIds] : [id, institutionId, terminal]
       )
-      const merchIds = items.filter(i => i.stockListId).map(i => i.id)
+      const merchIds = saleItems.filter(i => i.stockListId).map(i => i.id)
       await conn.query(
         `UPDATE tb_order_item_merchandise SET deleted = 'S', updated_at = NOW()
          WHERE tb_order_id = ? AND tb_institution_id = ? AND terminal = ?
@@ -390,7 +415,41 @@ router.post('/order-sale/sincronize', async (req: Request, res: Response) => {
       )
     }
 
-    // 7. Totalizador (PK id+institution+terminal = a do pedido)
+    // 6. Itens — SNAPSHOT ESCOPADO por kind='Service' (D6)
+    if (items) {
+      for (const item of items) {
+        const [products] = await conn.query<any[]>(
+          `SELECT id FROM tb_product WHERE id = ? AND tb_institution_id = ? LIMIT 1`,
+          [item.productId, institutionId]
+        )
+        if (!products.length) {
+          throw new HttpError(409, `Produto ${item.productId} ainda não sincronizado`,
+            [{ field: 'items.productId', message: 'sincronize o produto antes — reenvio no próximo ciclo' }],
+            'PRODUCT_NOT_SYNCED')
+        }
+        await conn.query(
+          `INSERT INTO tb_order_item
+             (id, tb_institution_id, tb_order_id, terminal, kind, tb_product_id,
+              quantity, unit_value, discount_aliquot, discount_value, deleted, created_at, updated_at)
+           VALUES (?, ?, ?, ?, 'Service', ?, ?, ?, ?, ?, ?, NOW(), NOW())
+           ON DUPLICATE KEY UPDATE
+             tb_product_id = VALUES(tb_product_id), quantity = VALUES(quantity),
+             unit_value = VALUES(unit_value), discount_aliquot = VALUES(discount_aliquot),
+             discount_value = VALUES(discount_value), deleted = VALUES(deleted), updated_at = NOW()`,
+          [item.id, institutionId, id, terminal, item.productId, item.quantity, item.unitValue,
+           item.discountAliquot ?? null, item.discountValue ?? null, deleted]
+        )
+      }
+      const keptIds = items.map(i => i.id)
+      await conn.query(
+        `UPDATE tb_order_item SET deleted = 'S', updated_at = NOW()
+         WHERE tb_order_id = ? AND tb_institution_id = ? AND terminal = ? AND kind = 'Service'
+           AND deleted = 'N'${keptIds.length ? ' AND id NOT IN (?)' : ''}`,
+        keptIds.length ? [id, institutionId, terminal, keptIds] : [id, institutionId, terminal]
+      )
+    }
+
+    // 7. Totalizador — ÚNICO do pedido (as duas classes enviam os mesmos valores)
     if (totalizer) {
       await conn.query(
         `INSERT INTO tb_order_totalizer
@@ -423,16 +482,21 @@ router.post('/order-sale/sincronize', async (req: Request, res: Response) => {
       )
     }
 
-    // 9. NOTA do processo (rodada 2 — D9/D10): tb_invoice + ramo mercadoria
+    // 9. NOTA do processo (rodada 2 — D9/D10): tb_invoice + ramo serviço
     // na MESMA transação do pedido (id compartilhado — D1)
     if (invoice && invoiceRefs) {
       await upsertInvoice(conn, institutionId, { ...invoice, id, terminal, deleted }, invoiceRefs)
-      await upsertMerchandiseRamo(conn, institutionId, id, terminal, invoice.merchandise, deleted)
+      await upsertServiceRamo(conn, institutionId, id, terminal, invoice.service, deleted)
+      // Conjugada (D13): ramo de mercadoria presente = nota também é de mercadoria
+      if (invoice.merchandise) {
+        await upsertMerchandiseRamo(conn, institutionId, id, terminal, invoice.merchandise, deleted)
+      }
     }
 
-    // 10. Soft delete em cascata (D2) — pega satélites fora do payload
+    // 10. Soft delete em cascata (D2) — a conjugada entra INTEIRA por aqui (D13),
+    // então a cascata cobre TODOS os ramos e itens do pedido
     if (deleted === 'S') {
-      for (const table of ['tb_order_sale', 'tb_order_totalizer', 'tb_order_billing']) {
+      for (const table of ['tb_order_service', 'tb_order_sale', 'tb_order_totalizer', 'tb_order_billing']) {
         await conn.query(
           `UPDATE ${table} SET deleted = 'S', updated_at = NOW()
            WHERE id = ? AND tb_institution_id = ? AND terminal = ? AND deleted = 'N'`,
@@ -456,7 +520,7 @@ router.post('/order-sale/sincronize', async (req: Request, res: Response) => {
       res.status(err.statusCode).json({ ok: false, error: err.message, fields: err.fields, code: err.code })
       return
     }
-    logger.error('Erro em /order-sale/sincronize', { err, client: req.syncClient })
+    logger.error('Erro em /order-service/sincronize', { err, client: req.syncClient })
     res.status(500).json(syncError(err.message))
   } finally {
     conn.release()
