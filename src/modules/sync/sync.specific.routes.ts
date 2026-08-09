@@ -12,13 +12,16 @@ import financialRouter             from './endpoints/financial'
 import invoiceRouter               from './endpoints/invoice'
 import invoicemerchandiseRouter    from './endpoints/invoicemerchandise'
 import invoicereturnRouter         from './endpoints/invoicereturn'
+import invoiceserviceRouter        from './endpoints/invoiceservice'
 import financialplansRouter        from './endpoints/financialplans'
 import financialstatementRouter    from './endpoints/financialstatement'
 import measureRouter               from './endpoints/measure'
 import merchandiseRouter           from './endpoints/merchandise'
 import orderpurchaseRouter         from './endpoints/orderpurchase'
 import ordersaleRouter             from './endpoints/ordersale'
+import orderserviceRouter          from './endpoints/orderservice'
 import orderstockadjustRouter      from './endpoints/orderstockadjust'
+import serviceRouter               from './endpoints/service'
 import packageRouter               from './endpoints/package'
 import paymenttypeRouter           from './endpoints/paymenttype'
 import priceRouter                 from './endpoints/price'
@@ -50,13 +53,16 @@ router.use(financialRouter)
 router.use(invoiceRouter)
 router.use(invoicemerchandiseRouter)
 router.use(invoicereturnRouter)
+router.use(invoiceserviceRouter)
 router.use(financialplansRouter)
 router.use(financialstatementRouter)
 router.use(measureRouter)
 router.use(merchandiseRouter)
 router.use(orderpurchaseRouter)
 router.use(ordersaleRouter)
+router.use(orderserviceRouter)
 router.use(orderstockadjustRouter)
+router.use(serviceRouter)
 router.use(packageRouter)
 router.use(paymenttypeRouter)
 router.use(priceRouter)

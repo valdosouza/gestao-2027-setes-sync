@@ -1,5 +1,7 @@
 import { PoolConnection } from 'mysql2/promise'
 import pool from '@shared/db/connection'
+import { HttpError } from '@shared/errors/http-error'
+import logger from '@shared/logger/logger'
 import { AddressInput, AddressRow } from './address.types'
 
 /**
@@ -9,12 +11,48 @@ import { AddressInput, AddressRow } from './address.types'
  * (conn da transação aberta pelo chamador).
  */
 
+/**
+ * Referências geográficas do endereço (1ª rodada real 2026-07-27: a FK de
+ * tb_state_id estourava em 500 — a referência central estava quase vazia).
+ * País/estado inexistentes = 409 legível (COUNTRY/STATE_NOT_FOUND — estados
+ * têm seed dos 27 IBGE); CIDADE inexistente é AUTO-CRIADA com nome
+ * placeholder (ids de cidade são os do legado — enriquecer nome/IBGE depois;
+ * indexação multi-cliente por IBGE é pendência da Rodada 4).
+ */
+async function ensureAddressRefs(conn: PoolConnection, a: AddressInput): Promise<void> {
+  const [countries] = await conn.query<any[]>(
+    `SELECT id FROM setes_central.tb_country WHERE id = ? LIMIT 1`, [a.tbCountryId])
+  if (!countries.length) {
+    throw new HttpError(409, `País ${a.tbCountryId} não existe na referência central`,
+      [{ field: 'addresses.tbCountryId', message: 'cadastre o país na central e reenvie' }],
+      'COUNTRY_NOT_FOUND')
+  }
+  const [states] = await conn.query<any[]>(
+    `SELECT id FROM setes_central.tb_state WHERE id = ? LIMIT 1`, [a.tbStateId])
+  if (!states.length) {
+    throw new HttpError(409, `Estado ${a.tbStateId} não existe na referência central`,
+      [{ field: 'addresses.tbStateId', message: 'cadastre o estado (IBGE) na central e reenvie' }],
+      'STATE_NOT_FOUND')
+  }
+  const [cities] = await conn.query<any[]>(
+    `SELECT id FROM setes_central.tb_city WHERE id = ? LIMIT 1`, [a.tbCityId])
+  if (!cities.length) {
+    logger.warn(`tb_city ${a.tbCityId} auto-criada (placeholder) para o endereço do legado`)
+    await conn.query(
+      `INSERT INTO setes_central.tb_city (id, tb_state_id, name, created_at, updated_at)
+       VALUES (?, ?, ?, NOW(), NOW())`,
+      [a.tbCityId, a.tbStateId, `CIDADE ${a.tbCityId} (legado — enriquecer)`]
+    )
+  }
+}
+
 /** Diff por kind: upsert dos enviados, deleted='S' nos ausentes (nunca DELETE). */
 export async function syncAddresses(
   conn: PoolConnection, entityId: number, addresses: AddressInput[],
   updatedBy: number | null = null
 ): Promise<void> {
   for (const a of addresses) {
+    await ensureAddressRefs(conn, a)
     await conn.query(
       `INSERT INTO setes_central.tb_address
          (id, kind, street, nmbr, complement, neighborhood, zip_code,

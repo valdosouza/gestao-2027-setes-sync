@@ -5,6 +5,7 @@ import { syncSuccess, syncError } from '../sync.response'
 import { ensureCatalogItem, upsertCatalogLink } from '../sync.catalog'
 import { HttpError } from '@shared/errors/http-error'
 import logger from '@shared/logger/logger'
+import { snFlag } from '@shared/validation'
 
 const router = Router()
 
@@ -19,16 +20,21 @@ const router = Router()
  * deleted='S' desabilita o vínculo (enable='N'); a linha central fica.
  * institution vem da API key (D12). Contrato: CONTRATOS_SYNC.md.
  */
+// Tolerância ao legado (rodada real 27/07 + decisão Valdo 2026-08-01):
+// flags '' = ausente (snFlag — não clobbera config web); idNfce '' = sem
+// código; maxParcels 0 → fallback 1 (a web CONSOME parcelas — 0 quebraria).
 const paymentTypeBody = z.object({
   description:              z.string().trim().min(1).max(45),
-  idNfce:                   z.string().regex(/^\d{2}$/, 'id_nfce da NFC-e tem 2 dígitos').optional(),
-  enable:                   z.enum(['S', 'N']).optional(),
-  appMobile:                z.enum(['S', 'N']).optional(),
-  blockForCustomerBlocked:  z.enum(['S', 'N']).optional(),
-  blockForCustomerNoLimit:  z.enum(['S', 'N']).optional(),
-  maxParcels:               z.number().int().min(1).optional(),
-  tef:                      z.enum(['S', 'N']).optional(),
-  deleted:                  z.enum(['S', 'N']).optional().default('N'),
+  idNfce:                   z.preprocess(v => (v === '' ? undefined : v),
+    z.string().regex(/^\d{2}$/, 'id_nfce da NFC-e tem 2 dígitos').optional()),
+  enable:                   snFlag(),
+  appMobile:                snFlag(),
+  blockForCustomerBlocked:  snFlag(),
+  blockForCustomerNoLimit:  snFlag(),
+  maxParcels:               z.preprocess(v => (v === 0 ? 1 : v),
+    z.number().int().min(1).optional()),
+  tef:                      snFlag(),
+  deleted:                  snFlag('N'),
 })
 
 /**

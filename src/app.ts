@@ -4,7 +4,9 @@ import dotenv from 'dotenv'
 dotenv.config()
 
 import { rateLimitMiddleware } from '@gateway/rate-limit.middleware'
+import { syncErrorLogMiddleware } from '@gateway/sync-error-log.middleware'
 import syncSpecificRoutes from '@modules/sync/sync.specific.routes'
+import testSyncRoutes from '@modules/test/test-sync.routes'
 import logger from '@shared/logger/logger'
 import { swaggerSpec } from '@shared/swagger/swagger-config'
 
@@ -40,10 +42,17 @@ app.get('/health', (_, res) =>
   res.json({ status: 'ok', service: 'setes-sync', ts: new Date().toISOString() })
 )
 
+// Rotas de teste do Sincronizador (System de testes incremental)
+// Ex: GET /api/test/dependency-map, POST /api/test/sessions, etc.
+app.use('/api/test', testSyncRoutes)
+
 // Rotas específicas do Sincronizador Delphi
 // Ex: POST /brand/sincronize, POST /customer/sincronize, etc.
 // Auth (X-Api-Key) é validado dentro de sync.specific.routes via syncAuthMiddleware
 app.use(rateLimitMiddleware)
+// Log central de respostas >= 400 dos /sincronize (console + logs/sync-errors.log)
+// — os endpoints respondem HttpError sem logar; o detalhe (fields) morreria aqui.
+app.use(syncErrorLogMiddleware)
 app.use('/', syncSpecificRoutes)
 
 // Handler global de erros

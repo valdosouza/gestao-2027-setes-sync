@@ -56,6 +56,36 @@ describe('setes-sync — Integration Tests', () => {
     })
   })
 
+  describe('POST /service/sincronize', () => {
+    it('retorna 401 sem X-Api-Key', async () => {
+      const res = await request(app)
+        .post('/service/sincronize')
+        .send({ id: 1, product: { description: 'TROCA DE OLEO', categoryId: 1 } })
+
+      expect(res.status).toBe(401)
+    })
+  })
+
+  describe('POST /order-service/sincronize', () => {
+    it('retorna 401 sem X-Api-Key', async () => {
+      const res = await request(app)
+        .post('/order-service/sincronize')
+        .send({ id: 1, terminal: 0, service: { customerDocument: '52998224725' } })
+
+      expect(res.status).toBe(401)
+    })
+  })
+
+  describe('POST /invoice-service/sincronize', () => {
+    it('retorna 401 sem X-Api-Key', async () => {
+      const res = await request(app)
+        .post('/invoice-service/sincronize')
+        .send({ id: 1, terminal: 0, kindEmis: 'SE', number: '1', dtEmission: '2026-07-26', value: 10 })
+
+      expect(res.status).toBe(401)
+    })
+  })
+
   describe('POST /user/sincronize', () => {
     it('retorna 401 sem X-Api-Key', async () => {
       const res = await request(app)

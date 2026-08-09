@@ -4,6 +4,8 @@ import pool from '@shared/db/connection'
 import { syncSuccess, syncError } from '../sync.response'
 import { findEntityIdByDocument } from '../sync.entity'
 import { userRefBody, resolveUserId, resolveFallbackUserId } from '../sync.user'
+import { invoiceProcessBlock, resolveInvoiceRefs, upsertInvoice, InvoiceRefs } from './invoice'
+import { merchandiseRamoBlock, upsertMerchandiseRamo } from './invoicemerchandise'
 import { HttpError } from '@shared/errors/http-error'
 import logger from '@shared/logger/logger'
 
@@ -47,6 +49,11 @@ const orderStockAdjustBody = z.object({
   }),
   items: z.array(itemBody).optional(),
   user: userRefBody.optional(),
+  // Rodada 2 (D9/D10): objeto COMPLETO — a nota do ajuste viaja junto do
+  // pedido e é gravada na MESMA transação (ramo tb_invoice_merchandise).
+  invoice: invoiceProcessBlock.extend({
+    merchandise: merchandiseRamoBlock.optional().default({}),
+  }).optional(),
 })
 
 /**
@@ -105,6 +112,20 @@ const orderStockAdjustBody = z.object({
  *                     unitValue: { type: number }
  *                     discountAliquot: { type: number }
  *                     discountValue: { type: number }
+ *               invoice:
+ *                 type: object
+ *                 description: >-
+ *                   Objeto COMPLETO (rodada 2 D9/D10) — a nota do ajuste, gravada na
+ *                   mesma transação (campos do /invoice sem id/terminal/deleted) +
+ *                   bloco merchandise (ramo tb_invoice_merchandise).
+ *                 properties:
+ *                   kindEmis: { type: string, example: "EI" }
+ *                   number: { type: string, example: "000124" }
+ *                   dtEmission: { type: string, example: "2026-07-27" }
+ *                   value: { type: number, example: 15 }
+ *                   merchandise:
+ *                     type: object
+ *                     description: Ramo de mercadoria (mesmos campos do /invoice-merchandise)
  *     responses:
  *       200: { description: "{ ok, id }" }
  *       400: { description: Payload inválido }
@@ -120,10 +141,16 @@ router.post('/order-stock-adjust/sincronize', async (req: Request, res: Response
       throw new HttpError(400, 'Payload inválido',
         parsed.error.issues.map(i => ({ field: i.path.join('.'), message: i.message })))
     }
-    const { id, terminal, deleted, order, adjust, items, user } = parsed.data
+    const { id, terminal, deleted, order, adjust, items, user, invoice } = parsed.data
     const { institutionId, schemaName } = req.syncClient!
 
     await conn.beginTransaction()
+
+    // 0. Refs da NOTA (rodada 2 — D9): resolvidas na central, antes do USE
+    let invoiceRefs: InvoiceRefs | null = null
+    if (invoice) {
+      invoiceRefs = await resolveInvoiceRefs(conn, { ...invoice, id, terminal, deleted })
+    }
 
     // 1. Entidade do ajuste — OPCIONAL, por DOCUMENTO (D3); ausente = 0
     let entityId = 0
@@ -202,7 +229,13 @@ router.post('/order-stock-adjust/sincronize', async (req: Request, res: Response
       )
     }
 
-    // 5. Soft delete em cascata (D2)
+    // 5. NOTA do processo (rodada 2 — D9/D10): tb_invoice + ramo mercadoria
+    if (invoice && invoiceRefs) {
+      await upsertInvoice(conn, institutionId, { ...invoice, id, terminal, deleted }, invoiceRefs)
+      await upsertMerchandiseRamo(conn, institutionId, id, terminal, invoice.merchandise, deleted)
+    }
+
+    // 6. Soft delete em cascata (D2)
     if (deleted === 'S') {
       await conn.query(
         `UPDATE tb_order_stock_adjust SET deleted = 'S', updated_at = NOW()

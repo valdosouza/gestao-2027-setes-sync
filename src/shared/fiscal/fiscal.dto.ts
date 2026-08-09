@@ -9,11 +9,18 @@ import { isValidCpf, isValidCnpj } from '../validation'
 
 const dateRe = /^\d{4}-\d{2}-\d{2}$/
 
+// Legado manda data VAZIA ('') quando não preenchida — 1ª rodada real
+// 2026-07-27: 70 clientes barrados por company.dtFoundation ''. Vazio = null.
+const optionalDate = z.preprocess(
+  v => (v === '' ? null : v),
+  z.string().regex(dateRe).nullable().optional()
+)
+
 export const personBody = z.object({
   cpf:      z.string().regex(/^\d{11}$/, 'CPF deve ter 11 dígitos numéricos, sem máscara')
              .refine(isValidCpf, 'CPF inválido (dígito verificador não confere)'),
   rg:       z.string().max(20).nullable().optional(),
-  birthday: z.string().regex(dateRe).nullable().optional(),
+  birthday: optionalDate,
 })
 
 export const companyBody = z.object({
@@ -21,5 +28,5 @@ export const companyBody = z.object({
                  .refine(isValidCnpj, 'CNPJ inválido (dígito verificador não confere)'),
   ie:           z.string().max(45).nullable().optional(),
   im:           z.string().max(45).nullable().optional(),
-  dtFoundation: z.string().regex(dateRe).nullable().optional(),
+  dtFoundation: optionalDate,
 })

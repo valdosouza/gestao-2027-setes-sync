@@ -1,6 +1,9 @@
 import pool from '@shared/db/connection'
 import { PoolConnection } from 'mysql2/promise'
-import { saveSyncEntity, syncEntityBody, stripDocumentMasks, SyncEntityInput } from '@modules/sync/sync.entity'
+import {
+  saveSyncEntity, syncEntityBody, stripDocumentMasks, SyncEntityInput,
+  resolveSentinelRole,
+} from '@modules/sync/sync.entity'
 
 /**
  * Prova os critérios de sucesso 2 e 3 do prompt da revisão
@@ -60,6 +63,7 @@ const createdEntityIds: number[] = []
 afterAll(async () => {
   if (createdEntityIds.length) {
     const ids = createdEntityIds.join(',')
+    await pool.query(`DELETE FROM setes_central.tb_address WHERE id IN (${ids})`)
     await pool.query(`DELETE FROM setes_central.tb_entity_has_mailing WHERE tb_entity_id IN (${ids})`)
     await pool.query(`DELETE FROM setes_central.tb_person  WHERE id IN (${ids})`)
     await pool.query(`DELETE FROM setes_central.tb_company WHERE id IN (${ids})`)
@@ -129,6 +133,58 @@ describe('motor de reindexação (sync.entity)', () => {
     expect(second.entityId).toBe(first.entityId)
     expect(second.externalCode).toBe(first.externalCode)
     expect(second.reused).toBe(true)
+  })
+
+  it('fallback geográfico: trio inexistente cai para o trio do institution (decisão 2026-08-01)', async () => {
+    // Trio VÁLIDO qualquer da referência central (seed 06 garante ≥1 cidade)
+    const [geo] = await pool.query<any[]>(
+      `SELECT ci.id AS city, ci.tb_state_id AS state, st.tb_country_id AS country
+       FROM setes_central.tb_city ci
+       JOIN setes_central.tb_state st ON st.id = ci.tb_state_id
+       LIMIT 1`)
+    expect(geo.length).toBe(1)
+    const trio = geo[0]
+
+    // "Institution": entity com endereço main usando o trio válido (herança
+    // por PK — o id da entity é o que o fallback consulta)
+    const inst = await inTransaction(conn =>
+      saveSyncEntity(conn, baseInput({
+        personType: 'N',
+        addresses: [{ kind: 'COMERCIAL', street: 'RUA DO INSTITUTION',
+          tbCountryId: trio.country, tbStateId: trio.state, tbCityId: trio.city, main: 'S' }],
+      })))
+    createdEntityIds.push(inst.entityId)
+
+    // Cliente com cidade INEXISTENTE → endereço cai para o trio do institution
+    const cust = await inTransaction(conn =>
+      saveSyncEntity(conn, baseInput({
+        personType: 'F', person: { cpf: genCpf() },
+        addresses: [{ kind: 'COMERCIAL', street: 'RUA DO CLIENTE',
+          tbCountryId: trio.country, tbStateId: trio.state, tbCityId: 999999999, main: 'S' }],
+      }), { origin: 'test-geo', institutionId: inst.entityId }))
+    createdEntityIds.push(cust.entityId)
+
+    const [rows] = await pool.query<any[]>(
+      `SELECT tb_country_id AS country, tb_state_id AS state, tb_city_id AS city
+       FROM setes_central.tb_address WHERE id = ? AND deleted = 'N'`, [cust.entityId])
+    expect(rows.length).toBe(1)
+    expect(rows[0]).toMatchObject({ country: trio.country, state: trio.state, city: trio.city })
+  })
+
+  it('sentinelas da opção b: CONSUMIDOR FINAL/VENDEDOR PADRAO idempotentes por institution', async () => {
+    const custA = await inTransaction(conn =>
+      resolveSentinelRole(conn, 1, 'setes_setes', 'customer'))
+    const custB = await inTransaction(conn =>
+      resolveSentinelRole(conn, 1, 'setes_setes', 'customer'))
+    expect(custB).toBe(custA) // reuso pelo nome + sem-doc — nunca duplica
+
+    const salesman = await inTransaction(conn =>
+      resolveSentinelRole(conn, 1, 'setes_setes', 'salesman'))
+    expect(salesman).not.toBe(custA)
+
+    createdEntityIds.push(custA, salesman)
+    await pool.query('DELETE FROM setes_setes.tb_customer WHERE id = ?', [custA])
+    await pool.query('DELETE FROM setes_setes.tb_salesman WHERE id = ?', [salesman])
   })
 
   it('externalCode desconhecido → 404 EXTERNAL_CODE_NOT_FOUND', async () => {

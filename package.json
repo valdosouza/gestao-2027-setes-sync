@@ -4,11 +4,20 @@
   "description": "API de sincronização de dados do Sincronizador Delphi para Gestao 2027",
   "scripts": {
     "dev": "tsx watch --require tsconfig-paths/register src/server.ts",
+    "start:dev": "npm run dev",
     "build": "tsc",
     "start": "node dist/server.js",
-    "test": "jest --runInBand --forceExit"
+    "test": "jest --runInBand --forceExit",
+    "db:migrate": "echo 'Migrations handled by setes-api (setes_central)'",
+    "test:sync:map": "tsx --require tsconfig-paths/register scripts/test-sync-cli.ts --map",
+    "test:sync:create": "tsx --require tsconfig-paths/register scripts/test-sync-cli.ts --create valdo@setes.com.br 1",
+    "test:sync:round": "tsx --require tsconfig-paths/register scripts/test-sync-cli.ts --round",
+    "test:sync:status": "tsx --require tsconfig-paths/register scripts/test-sync-cli.ts --status",
+    "test:sync:errors": "tsx --require tsconfig-paths/register scripts/test-sync-cli.ts --errors",
+    "test:sync:report": "tsx --require tsconfig-paths/register scripts/test-sync-cli.ts --report"
   },
   "dependencies": {
+    "axios": "^1.19.0",
     "date-fns": "^4.4.0",
     "dotenv": "^16.3.1",
     "express": "^4.18.2",

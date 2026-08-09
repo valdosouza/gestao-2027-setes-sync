@@ -20,15 +20,23 @@ const router = Router()
  * C(usto)/R(esultado); cluster = Nível S(intética)/A(nalítica).
  * Contrato: CONTRATOS_SYNC.md.
  */
+// Vazio/branco do legado = default do DDL (2026-08-01: plano raiz id=1 vinha
+// com source/cluster '' e barrava a árvore inteira — pai de todo mundo).
+const legacyEnum = <T extends [string, ...string[]]>(values: T, def: T[number]) =>
+  z.preprocess(
+    v => (typeof v === 'string' ? (v.trim() === '' ? undefined : v.trim()) : v),
+    z.enum(values).optional().default(def)
+  )
+
 const financialPlanBody = z.object({
   id:          z.number().int().positive(),
   description: z.string().trim().min(1).max(100),
   parentId:    z.number().int().min(0).optional().default(0),
-  source:      z.enum(['C', 'D']),
-  kind:        z.enum(['C', 'R']),
-  cluster:     z.enum(['S', 'A']),
-  active:      z.enum(['S', 'N']).optional().default('S'),
-  deleted:     z.enum(['S', 'N']).optional().default('N'),
+  source:      legacyEnum(['C', 'D'], 'C'),
+  kind:        legacyEnum(['C', 'R'], 'C'),
+  cluster:     legacyEnum(['S', 'A'], 'S'),
+  active:      legacyEnum(['S', 'N'], 'S'),
+  deleted:     legacyEnum(['S', 'N'], 'N'),
 })
 
 /**

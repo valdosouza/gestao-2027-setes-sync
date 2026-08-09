@@ -5,6 +5,7 @@ import { syncSuccess, syncError } from '../sync.response'
 import { ensureCatalogItem, upsertCatalogLink } from '../sync.catalog'
 import { HttpError } from '@shared/errors/http-error'
 import logger from '@shared/logger/logger'
+import { snFlag, legacyChar } from '@shared/validation'
 
 const router = Router()
 
@@ -19,19 +20,26 @@ const router = Router()
  * CATEGORY_NOT_SYNCED (o Sincronizador reenvia no próximo ciclo).
  * SALDO NÃO PASSA AQUI: quantity/minimum pertencem ao /stock-balance —
  * o INSERT abre com 0 e o UPDATE não toca nesses campos.
+ * NATUREZA (D2 — prompt_notas_mercadoria_servico.md, 2026-07-26): este
+ * endpoint só aceita mercadoria — product.kind 'P'/'M' (fallback de
+ * transição: merchandise.kind legado); 'S' ou desconhecido = 422
+ * KIND_NOT_ALLOWED (serviço usa o /service/sincronize; 'A' aposentado).
+ * O kind é gravado em tb_product.kind.
  * deleted='S' = soft delete nas três linhas (D2). Contrato JSON limpo
  * camelCase em blocos {product, merchandise, stock} espelhando as tabelas
  * (D15 — o Delphi se adapta). Contrato: CONTRATOS_SYNC.md.
  */
 const productBlock = z.object({
+  // PRO_TIPO — '' = ausente (cai no fallback da rota; default final 'P')
+  kind:             legacyChar(),
   description:      z.string().trim().min(1).max(100),
   categoryId:       z.number().int().positive(),
   identifier:       z.string().trim().max(50).optional(),
   financialPlansId: z.number().int().positive().nullish(),
-  promotion:        z.enum(['S', 'N']).optional().default('N'),
-  highlights:       z.enum(['S', 'N']).optional().default('N'),
-  active:           z.enum(['S', 'N']).optional().default('S'),
-  published:        z.enum(['S', 'N']).optional().default('N'),
+  promotion:        snFlag('N'),
+  highlights:       snFlag('N'),
+  active:           snFlag('S'),
+  published:        snFlag('N'),
   note:             z.string().optional(),
 })
 
@@ -43,20 +51,24 @@ const merchandiseBlock = z.object({
   kindTributary:     z.string().trim().max(1).optional(),
   source:            z.string().trim().max(1).optional(),
   kind:              z.string().trim().max(45).optional(),
-  print:             z.enum(['S', 'N']).optional(),
-  controlSeries:     z.enum(['S', 'N']).optional(),
-  exclusiveDealer:   z.enum(['S', 'N']).optional(),
+  print:             snFlag(),
+  controlSeries:     snFlag(),
+  exclusiveDealer:   snFlag(),
   application:       z.string().optional(),
-  composition:       z.enum(['S', 'N']).optional(),
-  manufSignIndScale: z.enum(['S', 'N']).optional().default('S'),
+  // PRO_COMPOSICAO espelhado COMO ESTÁ ('1'/'2'/'3'/'5' no legado — decisão
+  // Valdo 2026-08-01; snFlag S/N barrava o catálogo inteiro, 8.588 itens)
+  composition:       legacyChar(),
+  manufSignIndScale: snFlag('S'),
 })
 
 const stockBlock = z.object({
   namePackage:      z.string().trim().max(100).optional(),
   nameMeasure:      z.string().trim().max(100).optional(),
   codebar:          z.string().trim().max(20).optional(),
-  st:               z.enum(['S', 'N']).optional().default('N'),
-  divisor:          z.number().int().positive().nullish(),
+  st:               snFlag('N'),
+  // PRO_DIVISOR espelhado COMO ESTÁ — 0 é valor legítimo do legado
+  // (decisão Valdo 2026-08-01; positive() barrava 840 itens)
+  divisor:          z.number().int().nonnegative().nullish(),
   location:         z.string().trim().max(100).optional(),
   weight:           z.number().nullish(),
   width:            z.number().nullish(),
@@ -65,8 +77,8 @@ const stockBlock = z.object({
   costManufactures: z.number().nullish(),
   actualCost:       z.number().nullish(),
   costPrice:        z.number().nullish(),
-  negative:         z.enum(['S', 'N']).optional(),
-  outline:          z.enum(['S', 'N']).optional(),
+  negative:         snFlag(),
+  outline:          snFlag(),
 })
 
 const merchandiseBody = z.object({
@@ -91,6 +103,8 @@ const merchandiseBody = z.object({
  *       local — inexistente = 409 CATEGORY_NOT_SYNCED (reenvio no próximo
  *       ciclo). quantity/minimum do estoque NÃO passam aqui (vêm do
  *       /stock-balance). deleted='S' = soft delete nas três linhas.
+ *       Natureza (D2): product.kind 'P'/'M' (gravado em tb_product.kind);
+ *       'S'/'A' = 422 KIND_NOT_ALLOWED (serviço usa /service/sincronize).
  *     tags: [Sincronização]
  *     security: [{ ApiKeyAuth: [] }]
  *     requestBody:
@@ -107,6 +121,7 @@ const merchandiseBody = z.object({
  *                 type: object
  *                 required: [description, categoryId]
  *                 properties:
+ *                   kind: { type: string, enum: [P, M], example: "P", description: Natureza (PRO_TIPO) — serviço usa /service }
  *                   description: { type: string, example: "REFRIGERANTE COLA 2L" }
  *                   categoryId: { type: integer, example: 12 }
  *                   identifier: { type: string, example: "7891234" }
@@ -155,6 +170,7 @@ const merchandiseBody = z.object({
  *       400: { description: Payload inválido }
  *       401: { description: X-Api-Key inválida ou ausente }
  *       409: { description: Categoria ainda não sincronizada — reenviar depois }
+ *       422: { description: KIND_NOT_ALLOWED — kind 'S' (usa /service) ou 'A' (aposentado) }
  *       500: { description: Erro ao processar }
  */
 router.post('/merchandise/sincronize', async (req: Request, res: Response) => {
@@ -167,6 +183,17 @@ router.post('/merchandise/sincronize', async (req: Request, res: Response) => {
     }
     const { id, deleted, product, merchandise, stock } = parsed.data
     const { institutionId, schemaName } = req.syncClient!
+
+    // Natureza (D2): 'P'/'M' passam; 'S' vai para o /service; 'A' aposentado.
+    // Fallback de transição: executáveis antigos mandam o PRO_TIPO só em
+    // merchandise.kind — usa-o quando product.kind não veio ('' conta como
+    // ausente; PRO_TIPO null → 'P', decisão Valdo 2026-08-01).
+    const kind = product.kind || merchandise.kind || 'P'
+    if (kind !== 'P' && kind !== 'M') {
+      throw new HttpError(422, `kind '${kind}' não é aceito no /merchandise`,
+        [{ field: 'product.kind', message: "serviço ('S') usa o /service/sincronize; 'A' está aposentado" }],
+        'KIND_NOT_ALLOWED')
+    }
 
     await conn.beginTransaction()
 
@@ -210,19 +237,19 @@ router.post('/merchandise/sincronize', async (req: Request, res: Response) => {
     if (exProduct.length) {
       await conn.query(
         `UPDATE tb_product
-         SET identifier = ?, description = ?, tb_category_id = ?, tb_financial_plans_id = ?,
+         SET kind = ?, identifier = ?, description = ?, tb_category_id = ?, tb_financial_plans_id = ?,
              promotion = ?, highlights = ?, active = ?, published = ?, note = ?, deleted = ?,
              updated_at = NOW()
          WHERE id = ? AND tb_institution_id = ?`,
-        [...productValues, id, institutionId]
+        [kind, ...productValues, id, institutionId]
       )
     } else {
       await conn.query(
         `INSERT INTO tb_product
-           (id, tb_institution_id, identifier, description, tb_category_id, tb_financial_plans_id,
+           (id, tb_institution_id, kind, identifier, description, tb_category_id, tb_financial_plans_id,
             promotion, highlights, active, published, note, deleted, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())`,
-        [id, institutionId, ...productValues]
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())`,
+        [id, institutionId, kind, ...productValues]
       )
     }
 

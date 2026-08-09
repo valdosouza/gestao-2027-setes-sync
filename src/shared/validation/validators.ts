@@ -71,3 +71,28 @@ export function matchesMask(mask: string | null | undefined, value: string): boo
 export function stripNonDigits(value: string): string {
   return value.replace(/\D/g, '')
 }
+
+/**
+ * Enum 'S'/'N' TOLERANTE ao legado (1ª rodada real 2026-07-27; espaço
+ * 2026-08-01): campos CHAR não preenchidos chegam como '' OU ' ' (CHAR(1)
+ * do Firebird vem PADDED com espaço) — vazio/branco vira undefined (aplica
+ * o default); valor real é TRIMADO antes do enum.
+ */
+import { z } from 'zod'
+export const snFlag = (def?: 'S' | 'N') => z.preprocess(
+  v => (typeof v === 'string' ? (v.trim() === '' ? undefined : v.trim()) : v),
+  def === undefined ? z.enum(['S', 'N']).optional() : z.enum(['S', 'N']).optional().default(def)
+)
+
+/**
+ * Char(1) ESPELHO do legado (decisão Valdo 2026-08-01, diagnóstico do
+ * sync-errors.log): o valor do Firebird viaja COMO ESTÁ (ex.:
+ * PRO_COMPOSICAO '1'/'2'/'3'/'5') — a web guarda o espelho, sem impor
+ * domínio S/N. Vazio/branco = ausente (aplica o default, quando houver).
+ */
+export const legacyChar = (def?: string) => z.preprocess(
+  v => (typeof v === 'string' && v.trim() === '' ? undefined : v),
+  def === undefined
+    ? z.string().trim().max(1).optional()
+    : z.string().trim().max(1).optional().default(def)
+)

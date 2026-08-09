@@ -21,7 +21,12 @@ const router = Router()
 const categoryBody = z.object({
   id:          z.number().int().positive(),
   description: z.string().trim().min(1).max(100),
-  kind:        z.enum(['P', 'S']),
+  // Categorias migradas do legado vêm sem tipo ('' — 164 barradas em
+  // 2026-07-31): vazio/ausente = 'P' (decisão Valdo 2026-08-01)
+  kind:        z.preprocess(
+    v => (typeof v === 'string' && v.trim() === '' ? undefined : v),
+    z.enum(['P', 'S']).optional().default('P')
+  ),
   parentId:    z.number().int().min(0).optional().default(0),
   active:      z.enum(['S', 'N']).optional().default('S'),
   deleted:     z.enum(['S', 'N']).optional().default('N'),

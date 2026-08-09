@@ -4,6 +4,8 @@ import pool from '@shared/db/connection'
 import { syncSuccess, syncError } from '../sync.response'
 import { findEntityIdByDocument } from '../sync.entity'
 import { userRefBody, resolveUserId, resolveFallbackUserId } from '../sync.user'
+import { invoiceProcessBlock, resolveInvoiceRefs, upsertInvoice, InvoiceRefs } from './invoice'
+import { merchandiseRamoBlock, upsertMerchandiseRamo } from './invoicemerchandise'
 import { HttpError } from '@shared/errors/http-error'
 import logger from '@shared/logger/logger'
 
@@ -58,6 +60,11 @@ const orderPurchaseBody = z.object({
     totalValue:      z.number().optional().nullable(),
   }).optional(),
   user: userRefBody.optional(),
+  // Rodada 2 (D9/D10): objeto COMPLETO — a nota de entrada viaja junto do
+  // pedido e é gravada na MESMA transação (ramo tb_invoice_merchandise).
+  invoice: invoiceProcessBlock.extend({
+    merchandise: merchandiseRamoBlock.optional().default({}),
+  }).optional(),
 })
 
 /**
@@ -128,6 +135,22 @@ const orderPurchaseBody = z.object({
  *                   discountValue: { type: number }
  *                   expensesValue: { type: number }
  *                   totalValue: { type: number, example: 55 }
+ *               invoice:
+ *                 type: object
+ *                 description: >-
+ *                   Objeto COMPLETO (rodada 2 D9/D10) — a nota de ENTRADA do processo,
+ *                   gravada na mesma transação (campos do /invoice sem id/terminal/deleted;
+ *                   issuer 'N' com entityDocument do fornecedor) + bloco merchandise.
+ *                 properties:
+ *                   issuer: { type: string, enum: [S, N], example: "N" }
+ *                   kindEmis: { type: string, example: "EE" }
+ *                   number: { type: string, example: "000124" }
+ *                   entityDocument: { type: string, example: "11222333000181" }
+ *                   dtEmission: { type: string, example: "2026-07-27" }
+ *                   value: { type: number, example: 55 }
+ *                   merchandise:
+ *                     type: object
+ *                     description: Ramo de mercadoria (mesmos campos do /invoice-merchandise)
  *     responses:
  *       200: { description: "{ ok, id }" }
  *       400: { description: Payload inválido }
@@ -143,10 +166,16 @@ router.post('/order-purchase/sincronize', async (req: Request, res: Response) =>
       throw new HttpError(400, 'Payload inválido',
         parsed.error.issues.map(i => ({ field: i.path.join('.'), message: i.message })))
     }
-    const { id, terminal, deleted, order, purchase, items, totalizer, user } = parsed.data
+    const { id, terminal, deleted, order, purchase, items, totalizer, user, invoice } = parsed.data
     const { institutionId, schemaName } = req.syncClient!
 
     await conn.beginTransaction()
+
+    // 0. Refs da NOTA (rodada 2 — D9): resolvidas na central, antes do USE
+    let invoiceRefs: InvoiceRefs | null = null
+    if (invoice) {
+      invoiceRefs = await resolveInvoiceRefs(conn, { ...invoice, id, terminal, deleted })
+    }
 
     // 1. Fornecedor por DOCUMENTO (D3) — entity na central + papel no schema
     const providerId = await findEntityIdByDocument(conn, purchase.providerDocument)
@@ -250,7 +279,13 @@ router.post('/order-purchase/sincronize', async (req: Request, res: Response) =>
       )
     }
 
-    // 6. Soft delete em cascata (D2)
+    // 6. NOTA do processo (rodada 2 — D9/D10): tb_invoice + ramo mercadoria
+    if (invoice && invoiceRefs) {
+      await upsertInvoice(conn, institutionId, { ...invoice, id, terminal, deleted }, invoiceRefs)
+      await upsertMerchandiseRamo(conn, institutionId, id, terminal, invoice.merchandise, deleted)
+    }
+
+    // 7. Soft delete em cascata (D2)
     if (deleted === 'S') {
       for (const table of ['tb_order_purchase', 'tb_order_totalizer']) {
         await conn.query(
