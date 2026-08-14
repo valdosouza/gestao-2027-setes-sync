@@ -1,4 +1,5 @@
 import { Router, Request, Response } from 'express'
+import crypto from 'crypto'
 import fs from 'fs'
 import path from 'path'
 import { z } from 'zod'
@@ -19,9 +20,19 @@ const router = Router()
  * elo com tb_invoice_return_*.file_name. Contrato: CONTRATOS_SYNC.md.
  */
 const fileBody = z.object({
-  fileName:    z.string().trim().min(1).max(100)
-                .regex(/^[A-Za-z0-9._-]+$/, 'fileName inválido (sem caminhos/caracteres especiais)'),
-  contentBase64: z.string().min(1),
+  // Registros antigos de TB_ARQUIVOS guardam o CAMINHO completo do desktop
+  // (C:\Setes\...\Notas\<arquivo>.xml) — extrai o basename antes de validar;
+  // a guarda anti path-traversal continua valendo sobre o nome final.
+  // Vazio é permitido AQUI para o handler decidir: sem conteúdo o registro é
+  // ignorado com 200 (fila limpa); com conteúdo mas sem nome continua 400.
+  fileName:    z.string().trim()
+                .transform(s => s.split(/[\\/]/).pop() ?? '')
+                .pipe(z.string().max(100)
+                  .regex(/^[A-Za-z0-9._-]*$/, 'fileName inválido (sem caminhos/caracteres especiais)')),
+  // Blob ARQ_CONTEUDO pode estar VAZIO no legado (implantação Setes
+  // 2026-08-14: 20 de 8.407, todos NFS-e) — aceita e trata no handler
+  // (200 sem gravar, com log), senão o registro fica em 400 eterno na fila.
+  contentBase64: z.string(),
   dtReference:   z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
 })
 
@@ -71,15 +82,42 @@ router.post('/filexml/sincronize', async (req: Request, res: Response) => {
     const { fileName, contentBase64, dtReference } = parsed.data
     const { institutionId, establishmentCode } = req.syncClient!
 
+    // Sem conteúdo não há arquivo a gravar — 200 para a fila marcar OK e
+    // limpar (mesma decisão do saldo de serviço); o log preserva o rastro
+    // para revisão do dado no legado.
+    if (contentBase64.length === 0) {
+      logger.warn('XML sem conteúdo (blob vazio no legado) — ignorado', { fileName })
+      res.json(syncSuccess(0))
+      return
+    }
+    // Conteúdo existe mas o legado não conseguiu derivar o nome (TB_RETORNO_NFS
+    // ausente/sem NFS_ARQUIVO — implantação Setes 2026-08-14: 42 casos). O elo
+    // com tb_invoice_return_*.file_name já não existe nesses registros; grava
+    // com nome determinístico pelo hash do conteúdo (idempotente no reenvio)
+    // para preservar o XML e deixar a fila limpar.
+    let finalName = fileName
+    if (finalName.length === 0) {
+      const hash = crypto.createHash('sha1').update(contentBase64).digest('hex').slice(0, 12)
+      finalName = `sem-nome-${hash}.xml`
+      logger.warn('XML sem nome derivável no legado — gravado com nome por hash', { finalName })
+    }
+
     const cnpj = (await institutionCnpj(institutionId)) || establishmentCode
-    const [year, month] = dtReference.split('-')
+    // Ano/mês da pasta = data de EMISSÃO do documento (intenção da D20). O
+    // Delphi manda dtReference com a data do ENVIO (TB_ARQUIVOS não tem data
+    // própria — TODO do file_send_web.pas), então extrai do próprio XML:
+    // <dhEmi>/<dEmi> (NF-e/NFC-e) ou <DataEmissao> (NFS-e/RPS). Sem data no
+    // conteúdo, dtReference é o fallback.
+    const xml = Buffer.from(contentBase64, 'base64').toString('utf8')
+    const emission = /<\s*(?:dhEmi|dEmi|DataEmissao)\s*>\s*(\d{4})-(\d{2})/.exec(xml)
+    const [year, month] = emission ? [emission[1], emission[2]] : dtReference.split('-')
 
     const root = process.env.SYNC_FILES_ROOT ?? './storage/xml'
     const folder = path.join(root, cnpj, year, month)
     fs.mkdirSync(folder, { recursive: true })
-    fs.writeFileSync(path.join(folder, fileName), Buffer.from(contentBase64, 'base64'))
+    fs.writeFileSync(path.join(folder, finalName), Buffer.from(contentBase64, 'base64'))
 
-    logger.info('XML gravado', { cnpj, year, month, fileName })
+    logger.info('XML gravado', { cnpj, year, month, fileName: finalName })
     res.json(syncSuccess(0))
   } catch (err: any) {
     if (err instanceof HttpError) {

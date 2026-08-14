@@ -33,7 +33,8 @@ const stockBalanceBody = z.object({
  *       Upsert em tb_stock_balance do schema do cliente pela PK
  *       (institution, stockListId, merchandiseId) — ids locais do Firebird.
  *       Lista de estoque ou mercadoria inexistentes = 409 (reenvio no
- *       próximo ciclo). deleted='S' = soft delete.
+ *       próximo ciclo). Produto kind 'S' (serviço) = 200 sem gravar —
+ *       serviço não tem estoque na web. deleted='S' = soft delete.
  *     tags: [Sincronização]
  *     security: [{ ApiKeyAuth: [] }]
  *     requestBody:
@@ -78,6 +79,21 @@ router.post('/stock-balance/sincronize', async (req: Request, res: Response) => 
       throw new HttpError(409, `Lista de estoque ${stockListId} ainda não sincronizada`,
         [{ field: 'stockListId', message: 'sincronize a lista de estoque antes — reenvio no próximo ciclo' }],
         'STOCK_LIST_NOT_SYNCED')
+    }
+
+    // Produto SERVIÇO não tem estoque na web (kind 'S' — sem tb_merchandise/
+    // tb_stock por definição), mas o legado cria TB_ESTOQUE para todo produto
+    // e o Sincronizador envia o saldo. Sem este desvio o envio ficaria em 409
+    // MERCHANDISE_NOT_SYNCED ETERNO (serviço nunca terá mercadoria). Decisão
+    // Valdo 2026-08-14: responder 200 sem gravar — a fila marca OK e limpa.
+    const [services] = await conn.query<any[]>(
+      `SELECT id FROM tb_product WHERE id = ? AND tb_institution_id = ? AND kind = 'S' LIMIT 1`,
+      [merchandiseId, institutionId]
+    )
+    if (services.length) {
+      await conn.rollback()
+      res.json(syncSuccess(merchandiseId))
+      return
     }
 
     const [merchandises] = await conn.query<any[]>(

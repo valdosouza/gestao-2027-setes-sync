@@ -50,9 +50,14 @@ const returnServiceBody = z.object({
   nrRps:       z.number().int().optional().default(0),
   nrLot:       z.number().int().optional().default(0),
   protocol:    z.string().trim().max(50).nullable().optional(),
-  codeVerif:   z.string().trim().max(15).nullable().optional(),
+  // NFS_COD_VERIF é VARCHAR(100) no Firebird — prefeituras devolvem a
+  // própria chave da nota (50+ chars). Migration 024 alargou a coluna.
+  codeVerif:   z.string().trim().max(100).nullable().optional(),
   kind:        z.string().trim().max(1).nullable().optional(),
   synchronous: z.enum(['S', 'N']).optional().default('S'),
+  // NFS_MOTIVO é VARCHAR(255) no Firebird (rejeições de prefeitura são
+  // longas) — sobrepõe o max(60) do base; migration 024 alargou a coluna.
+  motive:      z.string().trim().max(255).nullable().optional(),
 })
 
 function handle(
