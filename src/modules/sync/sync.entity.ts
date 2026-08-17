@@ -16,9 +16,13 @@ import {
  *
  * Regras:
  * - O código do Firebird (emp_codigo) NUNCA indexa nada (D3).
- * - COM documento (F/J): saveEntityFiscalChain deduplica por CPF/CNPJ
- *   DENTRO da transação (FOR UPDATE) — mesmo CNPJ vindo de clientes
- *   diferentes da Setes cai na MESMA entity (D3).
+ * - COM documento (F/J): deduplica por CPF/CNPJ DENTRO da transação (FOR
+ *   UPDATE) — mesmo CNPJ vindo de clientes diferentes da Setes cai na MESMA
+ *   entity (D3). ⚠️ 2026-08-14 (Valdo): entity ACHADA pelo documento é
+ *   IMUTÁVEL aqui — reusa o id e NÃO reescreve a cadeia (fim do
+ *   last-write-wins neste lado; cadastro errado deixou de sobrescrever o
+ *   correto). Só a CRIAÇÃO grava. Vale para o sync; a setes-api/app segue
+ *   com a decisão 1 da Fase 3 (regra dos dois grupos — D1).
  * - SEM documento (N):
  *     · payload SEM externalCode → cria entity + tb_no_doc (UUID) e DEVOLVE
  *       o externalCode; o Sincronizador grava em tb_empresa.externalCode (D4).
@@ -134,17 +138,18 @@ export function stripDocumentMasks<T extends Record<string, any>>(body: T): T {
  * na central (o endpoint decide: 409 de reenvio ou campo NULL).
  */
 export async function findEntityIdByDocument(
-  conn: PoolConnection, document: string
+  conn: PoolConnection, document: string, lock = false
 ): Promise<number | null> {
   const digits = document.replace(/\D/g, '')
+  const forUpdate = lock ? ' FOR UPDATE' : ''
   if (digits.length === 11) {
     const [rows] = await conn.query<any[]>(
-      `SELECT id FROM setes_central.tb_person WHERE cpf = ? AND deleted = 'N' LIMIT 1`, [digits])
+      `SELECT id FROM setes_central.tb_person WHERE cpf = ? AND deleted = 'N' LIMIT 1${forUpdate}`, [digits])
     return rows.length ? Number(rows[0].id) : null
   }
   if (digits.length === 14) {
     const [rows] = await conn.query<any[]>(
-      `SELECT id FROM setes_central.tb_company WHERE cnpj = ? AND deleted = 'N' LIMIT 1`, [digits])
+      `SELECT id FROM setes_central.tb_company WHERE cnpj = ? AND deleted = 'N' LIMIT 1${forUpdate}`, [digits])
     return rows.length ? Number(rows[0].id) : null
   }
   return null
@@ -495,9 +500,27 @@ export async function saveSyncEntity(
       clearExternalCode = true
     }
   } else {
-    const result = await saveEntityFiscalChain(conn, null, input)
-    entityId = result.id
-    reused   = result.reused
+    /* ENTIDADE EXISTENTE É IMUTÁVEL PELO SYNC (Valdo, 2026-08-14) — inverte o
+     * last-write-wins da decisão 1 da Fase 3 SÓ deste lado: achou a entity pelo
+     * CPF/CNPJ, REUSA o id e NÃO reescreve nada da cadeia (tb_entity,
+     * tb_person/tb_company, endereços, telefones, redes). Motivo: cadastro
+     * ERRADO de um cliente sobrescrevia o dado CORRETO de outro — o mesmo
+     * documento vive em N institutions e quem sincronizasse por último ganhava.
+     * Quem cria primeiro vale; corrigir passa a ser ato deliberado (tela).
+     * ⚠️ Efeito colateral aceito: dado NOVO que a entity ainda não tem (ela sem
+     * endereço, payload com) também não entra — estratégia de convergência
+     * ainda a definir (registro de futuro na Infra-IA).
+     * FOR UPDATE segura a linha até o commit (mesma proteção de corrida do
+     * buscar-antes-de-criar da cadeia). */
+    const existing = doc ? await findEntityIdByDocument(conn, doc, true) : null
+    if (existing !== null) {
+      entityId = existing
+      reused   = true
+    } else {
+      const result = await saveEntityFiscalChain(conn, null, input)
+      entityId = result.id
+      reused   = result.reused
+    }
   }
 
   // Entradas null = email inválido do legado descartado no preprocess

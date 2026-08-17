@@ -11,7 +11,7 @@ const router = Router()
 /**
  * Caixa — id local ✅ (id do caixa no Firebird; PK id+institution+terminal).
  * AUTOR (prompt_indexacao_usuario_firebird.md, decisão 6): bloco `user`
- * opcional (userDocument OU userExternalCode) resolve tb_userid = entity.id
+ * opcional (userDocument OU userExternalCode) resolve tb_user_id = entity.id
  * do usuário do legado (409 USER_NOT_SYNCED); ausente → NULL (comportamento
  * anterior — o código local nunca viaja, D3). Reenvio COM bloco corrige o
  * autor. O contrato antigo com `items` (tb_cashier_items) foi REMOVIDO
@@ -39,7 +39,7 @@ const cashierBody = z.object({
  *     description: >-
  *       Upsert em tb_cashier com id local do Firebird (PK id+institution+
  *       terminal). Bloco `user` opcional (userDocument OU userExternalCode)
- *       resolve o autor (409 USER_NOT_SYNCED); ausente → tb_userid NULL.
+ *       resolve o autor (409 USER_NOT_SYNCED); ausente → tb_user_id NULL.
  *       Datas em YYYY-MM-DD[ HH:MM[:SS]].
  *     tags: [Sincronização]
  *     security: [{ ApiKeyAuth: [] }]
@@ -89,14 +89,14 @@ router.post('/cashier/sincronize', async (req: Request, res: Response) => {
 
     await conn.query(
       `INSERT INTO tb_cashier
-         (id, tb_institution_id, terminal, dt_record, tb_userid,
+         (id, tb_institution_id, terminal, dt_record, tb_user_id,
           hr_begin, hr_end, deleted, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())
        ON DUPLICATE KEY UPDATE
-         ${b.user ? 'tb_userid = VALUES(tb_userid),' : ''}
+         ${b.user ? 'tb_user_id = VALUES(tb_user_id),' : ''}
          dt_record = VALUES(dt_record), hr_begin = VALUES(hr_begin),
          hr_end = VALUES(hr_end), deleted = VALUES(deleted), updated_at = NOW()`,
-      // tb_userid só atualiza quando o bloco `user` veio (decisão 5).
+      // tb_user_id só atualiza quando o bloco `user` veio (decisão 5).
       [b.id, institutionId, b.terminal, b.dtRecord, userId,
        b.hrBegin ?? null, b.hrEnd ?? null, b.deleted]
     )

@@ -104,6 +104,36 @@ describe('motor de reindexação (sync.entity)', () => {
     expect(second.reused).toBe(true)
   })
 
+  it('entity achada por documento é IMUTÁVEL — reusa o id sem sobrescrever (Valdo 2026-08-14)', async () => {
+    const cnpj = genCnpj()
+    const first = await inTransaction(conn =>
+      saveSyncEntity(conn, baseInput({
+        personType: 'J',
+        entity: { nameCompany: 'CADASTRO CORRETO', nickTrade: 'CORRETO' },
+        company: { cnpj, ie: '1234567890' },
+      })))
+    createdEntityIds.push(first.entityId)
+
+    // Outro cliente da Setes manda o MESMO CNPJ com o cadastro ERRADO
+    const second = await inTransaction(conn =>
+      saveSyncEntity(conn, baseInput({
+        personType: 'J',
+        entity: { nameCompany: 'CADASTRO ERRADO', nickTrade: 'ERRADO' },
+        company: { cnpj, ie: 'ISENTO' },
+      })))
+    expect(second.entityId).toBe(first.entityId)
+    expect(second.reused).toBe(true)
+
+    // O dado CORRETO tem que ter sobrevivido — em tb_entity e em tb_company
+    const [entity] = await pool.query<any[]>(
+      `SELECT name_company, nick_trade FROM setes_central.tb_entity WHERE id = ?`, [first.entityId])
+    expect(entity[0].name_company).toBe('CADASTRO CORRETO')
+    expect(entity[0].nick_trade).toBe('CORRETO')
+    const [company] = await pool.query<any[]>(
+      `SELECT ie FROM setes_central.tb_company WHERE id = ?`, [first.entityId])
+    expect(company[0].ie).toBe('1234567890')
+  })
+
   it('critério 2 (PF): mesmo CPF reenviado NÃO duplica entity', async () => {
     const cpf = genCpf()
     const first = await inTransaction(conn =>

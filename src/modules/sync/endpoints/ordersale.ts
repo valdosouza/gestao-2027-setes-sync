@@ -3,6 +3,7 @@ import { z } from 'zod'
 import pool from '@shared/db/connection'
 import { PoolConnection } from 'mysql2/promise'
 import { syncSuccess, syncError } from '../sync.response'
+import { orderStatusField } from '../sync.order-status'
 import { findEntityIdByDocument, resolveSentinelRole, getInstitutionDocument, resolveSelfSalesman } from '../sync.entity'
 import { isValidCpf, isValidCnpj } from '@shared/validation'
 import { userRefBody, resolveUserId, resolveFallbackUserId } from '../sync.user'
@@ -70,7 +71,7 @@ const orderSaleBody = z.object({
   order: z.object({
     dtRecord: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().nullable(),
     note:     z.string().optional().nullable(),
-    status:   z.string().max(1).optional().nullable(),
+    status:   orderStatusField,
     origin:   z.string().max(1).optional().default('D'),
   }).optional().default({}),
   sale: z.object({
@@ -144,7 +145,7 @@ async function roleExists(
  *                 properties:
  *                   dtRecord: { type: string, example: "2026-07-19" }
  *                   note: { type: string }
- *                   status: { type: string, maxLength: 1 }
+ *                   status: { type: string, enum: [A, F], description: "Estado do processo: A=aberto, F=fechado. S do legado (PED_FATURADO faturado) e normalizado para F." }
  *                   origin: { type: string, maxLength: 1, example: "D" }
  *               sale:
  *                 type: object
