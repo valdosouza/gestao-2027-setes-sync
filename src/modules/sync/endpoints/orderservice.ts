@@ -295,7 +295,7 @@ router.post('/order-service/sincronize', async (req: Request, res: Response) => 
     // 2. Forma de pagamento por DESCRIÇÃO (catálogo central)
     let paymentTypeId = 0
     if (billing) {
-      const pt = await ensureCatalogItem(conn, 'tb_payment_types', billing.paymentTypeDescription)
+      const pt = await ensureCatalogItem(conn, 'tb_payment_types', { description: billing.paymentTypeDescription })
       paymentTypeId = pt.id
     }
 

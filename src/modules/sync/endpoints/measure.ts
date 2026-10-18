@@ -1,22 +1,30 @@
 import { Router, Request, Response } from 'express'
 import { z } from 'zod'
-import pool from '@shared/db/connection'
 import { syncSuccess, syncError } from '../sync.response'
-import { ensureCatalogItem, upsertCatalogLink } from '../sync.catalog'
+import { ensureAndLinkCatalogItem } from '../sync.catalog'
 import { HttpError } from '@shared/errors/http-error'
 import logger from '@shared/logger/logger'
 
 const router = Router()
 
 /**
- * Unidade de Medida — catálogo CENTRAL (D5): dedupe por descrição (D17) em
- * setes_central.tb_measure + vínculo tb_institution_has_measure. Id local
- * (MED_CODIGO) descartado. Endpoint NOVO — não existia na setes-sync
- * (gap achado na Onda 3). Contrato: CONTRATOS_SYNC.md.
+ * Unidade de Medida — catálogo CENTRAL (D5) em setes_central.tb_measure +
+ * vínculo tb_institution_has_measure. Id local (MED_CODIGO) descartado.
+ * Contrato: CONTRATOS_SYNC.md.
+ *
+ * CHAVE = ABREVIAÇÃO (D-SY10 = D-PR39, Valdo 2026-10-18): a medida é ÚNICA na
+ * central e a busca pela abreviação unifica o cadastro de todos os clientes —
+ * a MESMA sistemática do setes-api (UPPER(TRIM) binário + trava nomeada
+ * `setes_central.tb_measure`). A descrição e a escala são atributos gravados
+ * só na CRIAÇÃO (reuso não sobrescreve o catálogo compartilhado).
+ * A abreviação é OBRIGATÓRIA no contrato (o campo tem de vir); medida do
+ * legado com MED_ABREVIATURA vazia/nula resolve pela DESCRIÇÃO, como antes,
+ * com aviso no log. O legado guarda no máximo 5 (VARCHAR(5), domínio
+ * "Descricao_5") — a coluna central de 6 (D-PR35) comporta.
  */
-const measureBody = z.object({
+export const measureBody = z.object({
   description:  z.string().trim().min(1).max(100),
-  abbreviation: z.string().trim().max(5).nullable().optional(),
+  abbreviation: z.string().trim().max(5).nullable(),
   escale:       z.number().nullable().optional(),
   deleted:      z.enum(['S', 'N']).optional().default('N'),
 })
@@ -27,10 +35,13 @@ const measureBody = z.object({
  *   post:
  *     summary: Sincronizar Unidade de Medida (catálogo central + vínculo)
  *     description: >-
- *       Dedupe por descrição em setes_central.tb_measure (D5/D17) e vínculo
- *       em tb_institution_has_measure do schema do cliente. Atributos
- *       (abbreviation/escale) só entram na CRIAÇÃO da linha central — reuso
- *       não sobrescreve o catálogo compartilhado.
+ *       Dedupe pela ABREVIAÇÃO (D-SY10) em setes_central.tb_measure — a mesma
+ *       chave e a mesma trava nomeada do setes-api — e vínculo em
+ *       tb_institution_has_measure do schema do cliente. abbreviation é
+ *       obrigatória no payload; vazia/nula (medida do legado sem abreviação)
+ *       resolve pela descrição, com aviso no log. description/escale só entram
+ *       na CRIAÇÃO da linha central — reuso não sobrescreve o catálogo
+ *       compartilhado. deleted='S' desativa o vínculo (a linha central fica).
  *     tags: [Sincronização]
  *     security: [{ ApiKeyAuth: [] }]
  *     requestBody:
@@ -39,20 +50,21 @@ const measureBody = z.object({
  *         application/json:
  *           schema:
  *             type: object
- *             required: [description]
+ *             required: [description, abbreviation]
  *             properties:
  *               description: { type: string, example: "UNIDADE" }
- *               abbreviation: { type: string, example: "UND" }
+ *               abbreviation: { type: string, nullable: true, maxLength: 5, example: "UND", description: "Chave do dedupe (MED_ABREVIATURA); vazia = resolve pela descrição" }
  *               escale: { type: number, example: 1 }
  *               deleted: { type: string, enum: [S, N] }
  *     responses:
  *       200: { description: "{ ok, id } — id do catálogo central" }
- *       400: { description: Payload inválido }
- *       401: { description: X-Api-Key inválida ou ausente }
+ *       400: { description: Payload inválido (inclusive sem o campo abbreviation) }
+ *       401: { description: "X-Api-Key inexistente ou ausente (SYNC_KEY_INVALID / SYNC_KEY_MISSING)" }
+ *       403: { description: "Chave existente e INATIVA (SYNC_KEY_INACTIVE — D-SY13)" }
+ *       409: { description: "RESOURCE_BUSY — trava do catálogo central ocupada por mais de 10 s; reenviar" }
  *       500: { description: Erro ao processar }
  */
 router.post('/measure/sincronize', async (req: Request, res: Response) => {
-  const conn = await pool.getConnection()
   try {
     const parsed = measureBody.safeParse(req.body)
     if (!parsed.success) {
@@ -62,27 +74,18 @@ router.post('/measure/sincronize', async (req: Request, res: Response) => {
     const { description, abbreviation, escale, deleted } = parsed.data
     const { institutionId, schemaName } = req.syncClient!
 
-    await conn.beginTransaction()
-    const { id } = await ensureCatalogItem(conn, 'tb_measure', description, {
-      abbreviation: abbreviation ?? null,
-      escale:       escale ?? null,
-    })
-    await conn.query(`USE \`${schemaName}\``)
-    await upsertCatalogLink(conn, 'tb_institution_has_measure', 'tb_measure_id',
-      institutionId, id, { active: deleted === 'S' ? 'N' : 'S' })
-    await conn.commit()
+    const { id } = await ensureAndLinkCatalogItem('tb_measure', schemaName, institutionId,
+      { description, abbreviation, extras: { escale: escale ?? null } },
+      { active: deleted === 'S' ? 'N' : 'S' })
 
     res.json(syncSuccess(id))
   } catch (err: any) {
-    await conn.rollback()
     if (err instanceof HttpError) {
-      res.status(err.statusCode).json({ ok: false, error: err.message, fields: err.fields })
+      res.status(err.statusCode).json({ ok: false, error: err.message, fields: err.fields, code: err.code })
       return
     }
     logger.error('Erro em /measure/sincronize', { err, client: req.syncClient })
     res.status(500).json(syncError(err.message))
-  } finally {
-    conn.release()
   }
 })
 

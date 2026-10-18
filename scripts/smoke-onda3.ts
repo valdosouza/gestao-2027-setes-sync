@@ -46,8 +46,13 @@ const srv = app.listen(PORT, async () => {
     check('vínculo desativado (linha central fica)', link?.active === 'N')
 
     // Medida e Embalagem
-    const m1 = await post('/measure/sincronize', { description: `METRO SMOKE ${stamp}`, abbreviation: 'MT', escale: 1 })
+    // D-SY10: a CHAVE da medida é a abreviação — abreviação ÚNICA do smoke (uma real,
+    // ex. 'MT', seria REUSADA e a limpeza abaixo apagaria a medida verdadeira)
+    const mAbbr = `Z${String(stamp).slice(-4)}`
+    const m1 = await post('/measure/sincronize', { description: `METRO SMOKE ${stamp}`, abbreviation: mAbbr, escale: 1 })
     check('measure cria', m1.status === 200 && m1.body.id > 0)
+    const m2 = await post('/measure/sincronize', { description: `OUTRA DESCRICAO ${stamp}`, abbreviation: mAbbr.toLowerCase() })
+    check('measure dedupe pela abreviação (case-insensitive)', m2.status === 200 && m2.body.id === m1.body.id)
     const p1 = await post('/package/sincronize', { description: `CAIXA SMOKE ${stamp}`, abbreviation: 'CX' })
     check('package cria', p1.status === 200 && p1.body.id > 0)
 

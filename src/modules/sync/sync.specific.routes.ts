@@ -33,8 +33,14 @@ import stockbalanceRouter          from './endpoints/stockbalance'
 import stocklistRouter             from './endpoints/stocklist'
 import stockstatementRouter        from './endpoints/stockstatement'
 import userRouter                  from './endpoints/user'
+import synckeyRouter               from './endpoints/synckey'
 
 const router = Router()
+
+// Estado da chave (D-SY13) — ANTES do guard abaixo: o guard faz next('router')
+// em todo caminho sem 'sincronize' (rota registrada depois dele nunca seria
+// alcançada) e a consulta lê o banco sem o cache do middleware.
+router.use(synckeyRouter)
 
 // Auth apenas para rotas /sincronize — deixa outras passarem sem bloquear
 router.use((req, res, next) => {

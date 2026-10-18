@@ -80,7 +80,7 @@ router.post('/financial-statement/sincronize', async (req: Request, res: Respons
 
     let paymentTypeId = 0
     if (s.paymentTypeDescription) {
-      const pt = await ensureCatalogItem(conn, 'tb_payment_types', s.paymentTypeDescription)
+      const pt = await ensureCatalogItem(conn, 'tb_payment_types', { description: s.paymentTypeDescription })
       paymentTypeId = pt.id
     }
 

@@ -159,7 +159,7 @@ router.post('/customer/sincronize', async (req: Request, res: Response) => {
     // 3. Forma de pagamento da carteira por DESCRIÇÃO (catálogo central)
     let paymentTypeId = 0
     if (cust.paymentTypeDescription) {
-      const pt = await ensureCatalogItem(conn, 'tb_payment_types', cust.paymentTypeDescription)
+      const pt = await ensureCatalogItem(conn, 'tb_payment_types', { description: cust.paymentTypeDescription })
       paymentTypeId = pt.id
     }
 

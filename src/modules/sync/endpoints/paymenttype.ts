@@ -90,8 +90,8 @@ router.post('/payment-type/sincronize', async (req: Request, res: Response) => {
     const { institutionId, schemaName } = req.syncClient!
 
     await conn.beginTransaction()
-    const { id } = await ensureCatalogItem(conn, 'tb_payment_types', description,
-      { id_nfce: idNfce ?? null })
+    const { id } = await ensureCatalogItem(conn, 'tb_payment_types',
+      { description, extras: { id_nfce: idNfce ?? null } })
 
     // Atributos do VÍNCULO: só o que veio no payload (não clobbera config web)
     const attrs: Record<string, string | number> = {}

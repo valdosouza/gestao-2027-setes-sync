@@ -1,8 +1,9 @@
 import { Router, Request, Response } from 'express'
+import { PoolConnection } from 'mysql2/promise'
 import { z } from 'zod'
 import pool from '@shared/db/connection'
 import { syncSuccess, syncError } from '../sync.response'
-import { ensureCatalogItem, upsertCatalogLink } from '../sync.catalog'
+import { ensureAndLinkCatalogItem, CatalogItemInput } from '../sync.catalog'
 import { HttpError } from '@shared/errors/http-error'
 import logger from '@shared/logger/logger'
 import { snFlag, legacyChar } from '@shared/validation'
@@ -12,10 +13,17 @@ const router = Router()
 /**
  * Produto — ID LOCAL ✅ (MAPA_INDEXACAO #5): PRO_CODIGO do Firebird É o id
  * nas TRÊS tabelas do schema do cliente (tb_product / tb_merchandise /
- * tb_stock — PK por institution). Marca, embalagem e medida chegam por
- * DESCRIÇÃO e são resolvidas no catálogo CENTRAL (D5/D17: ensureCatalogItem)
- * + vínculo tb_institution_has_* no schema do cliente; descrição ausente cai
- * no legado documentado: 'NÃO INFORMADA' (marca) e 'UND' (embalagem/medida).
+ * tb_stock — PK por institution). Marca e embalagem chegam por DESCRIÇÃO e
+ * a medida pela ABREVIAÇÃO (D-SY10 = D-PR39, Valdo 2026-10-18 — a mesma chave
+ * do setes-api: `stock.measureAbbreviation`; executável antigo que só manda
+ * `stock.nameMeasure` resolve pela descrição, com aviso no log). Resolvidas no
+ * catálogo CENTRAL + vínculo tb_institution_has_* (ensureAndLinkCatalogItem,
+ * trava nomeada por catálogo, transação PRÓPRIA e ANTES da transação do
+ * produto — a trava é global, de todos os clientes, e não pode ficar presa
+ * durante a gravação do produto). Ausentes caem no legado documentado:
+ * marca 'NÃO INFORMADA', embalagem 'UND' (descrição) e medida 'UND'
+ * (ABREVIAÇÃO — antes era descrição e criava uma 2ª linha "UND" sem
+ * abreviação ao lado da "UNIDADE"/UND).
  * Categoria vem por id local — se ainda não sincronizada, 409
  * CATEGORY_NOT_SYNCED (o Sincronizador reenvia no próximo ciclo).
  * SALDO NÃO PASSA AQUI: quantity/minimum pertencem ao /stock-balance —
@@ -66,6 +74,10 @@ const merchandiseBlock = z.object({
 
 const stockBlock = z.object({
   namePackage:      z.string().trim().max(100).optional(),
+  // D-SY10: CHAVE da medida (MED_ABREVIATURA, até 5 no legado). Ausente/vazia
+  // = executável antigo → resolve por nameMeasure (descrição), com aviso.
+  measureAbbreviation: z.string().trim().max(5).optional(),
+  // descrição da medida: atributo da CRIAÇÃO quando vem a abreviação
   nameMeasure:      z.string().trim().max(100).optional(),
   codebar:          z.string().trim().max(20).optional(),
   st:               snFlag('N'),
@@ -99,10 +111,13 @@ export const merchandiseBody = z.object({
  *     summary: Sincronizar Produto (tb_product + tb_merchandise + tb_stock, id local)
  *     description: >-
  *       Upsert nas três tabelas do schema do cliente com id = PRO_CODIGO do
- *       Firebird (PK id+institution). Marca/embalagem/medida chegam por
- *       descrição (nameBrand/namePackage/nameMeasure) e são resolvidas no
- *       catálogo central + vínculo tb_institution_has_*; ausentes viram
- *       'NÃO INFORMADA' (marca) e 'UND' (embalagem/medida). Categoria por id
+ *       Firebird (PK id+institution). Marca/embalagem chegam por descrição
+ *       (nameBrand/namePackage) e a medida pela ABREVIAÇÃO
+ *       (stock.measureAbbreviation — D-SY10; sem ela, nameMeasure como
+ *       descrição para executáveis antigos), resolvidas no catálogo central
+ *       (trava nomeada por catálogo, a mesma do setes-api) + vínculo
+ *       tb_institution_has_*; ausentes viram 'NÃO INFORMADA' (marca),
+ *       'UND' (embalagem, descrição) e 'UND' (medida, abreviação). Categoria por id
  *       local — inexistente = 409 CATEGORY_NOT_SYNCED (reenvio no próximo
  *       ciclo). quantity/minimum do estoque NÃO passam aqui (vêm do
  *       /stock-balance). deleted='S' = soft delete nas três linhas.
@@ -154,7 +169,8 @@ export const merchandiseBody = z.object({
  *                 type: object
  *                 properties:
  *                   namePackage: { type: string, example: "GARRAFA" }
- *                   nameMeasure: { type: string, example: "UND" }
+ *                   measureAbbreviation: { type: string, maxLength: 5, example: "UND", description: "Chave da medida (MED_ABREVIATURA — D-SY10)" }
+ *                   nameMeasure: { type: string, example: "UNIDADE", description: "Descrição da medida — atributo da criação; sem measureAbbreviation (executável antigo) vira a chave" }
  *                   codebar: { type: string, example: "7894900011517" }
  *                   st: { type: string, enum: [S, N] }
  *                   divisor: { type: integer, nullable: true }
@@ -171,13 +187,55 @@ export const merchandiseBody = z.object({
  *     responses:
  *       200: { description: "{ ok, id } — id = PRO_CODIGO" }
  *       400: { description: Payload inválido }
- *       401: { description: X-Api-Key inválida ou ausente }
- *       409: { description: Categoria ainda não sincronizada — reenviar depois }
+ *       401: { description: "X-Api-Key inexistente ou ausente (SYNC_KEY_INVALID / SYNC_KEY_MISSING)" }
+ *       403: { description: "Chave existente e INATIVA (SYNC_KEY_INACTIVE — D-SY13)" }
+ *       409: { description: "CATEGORY_NOT_SYNCED (categoria ainda não sincronizada) ou RESOURCE_BUSY (trava do catálogo central ocupada por mais de 10 s) — reenviar depois" }
  *       422: { description: KIND_NOT_ALLOWED — kind 'S' (usa /service) ou 'A' (aposentado) }
  *       500: { description: Erro ao processar }
  */
+/**
+ * Entradas do catálogo central a partir do payload — fallbacks do legado.
+ * Medida: abreviação = chave (D-SY10); sem ela, a descrição (executável antigo);
+ * sem nenhuma, a ABREVIAÇÃO 'UND' (criada, se faltar, como "UNIDADE").
+ */
+export function merchandiseCatalogInputs(
+  merchandise: z.infer<typeof merchandiseBlock>, stock: z.infer<typeof stockBlock>
+): { brand: CatalogItemInput; package: CatalogItemInput; measure: CatalogItemInput } {
+  const measureAbbr = stock.measureAbbreviation?.trim() ?? ''
+  const measureDesc = stock.nameMeasure?.trim() ?? ''
+  const measure: CatalogItemInput = measureAbbr !== ''
+    ? { abbreviation: measureAbbr, description: measureDesc || measureAbbr }
+    : measureDesc !== ''
+      ? { description: measureDesc }
+      : { abbreviation: 'UND', description: 'UNIDADE' }
+  return {
+    brand:   { description: merchandise.nameBrand?.trim() || 'NÃO INFORMADA' },
+    package: { description: stock.namePackage?.trim()    || 'UND' },
+    measure,
+  }
+}
+
+type Queryable = Pick<PoolConnection, 'query'>
+
+/** 409 CATEGORY_NOT_SYNCED quando a categoria (id local) ainda não chegou. */
+async function assertCategorySynced(
+  q: Queryable, schemaName: string, institutionId: number, categoryId: number
+): Promise<void> {
+  const [cats] = await q.query<any[]>(
+    `SELECT id FROM \`${schemaName}\`.tb_category
+     WHERE id = ? AND tb_institution_id = ? AND deleted = 'N' LIMIT 1`,
+    [categoryId, institutionId]
+  )
+  if (!cats.length) {
+    throw new HttpError(409, `Categoria ${categoryId} ainda não sincronizada`,
+      [{ field: 'product.categoryId', message: 'sincronize a categoria antes — reenvio no próximo ciclo' }],
+      'CATEGORY_NOT_SYNCED')
+  }
+}
+
 router.post('/merchandise/sincronize', async (req: Request, res: Response) => {
-  const conn = await pool.getConnection()
+  let conn: PoolConnection | null = null
+  let inTransaction = false
   try {
     const parsed = merchandiseBody.safeParse(req.body)
     if (!parsed.success) {
@@ -198,34 +256,29 @@ router.post('/merchandise/sincronize', async (req: Request, res: Response) => {
         'KIND_NOT_ALLOWED')
     }
 
+    // Falha cedo, SEM efeito colateral: o 409 mais comum (categoria fora de ordem)
+    // não cria item central nem vínculo. Leitura simples — a de dentro da transação decide.
+    await assertCategorySynced(pool, schemaName, institutionId, product.categoryId)
+
+    // Catálogos centrais (D5/D17 + D-SY10) ANTES da transação do produto: cada um
+    // na sua transação curta sob a trava nomeada do catálogo (uma por vez — nunca
+    // duas travas nomeadas juntas) + vínculo vivo no schema do cliente (sem attrs:
+    // não mexe no active do vínculo). Se a gravação do produto falhar depois, o
+    // item central e o vínculo ficam — são dado real do legado e o reenvio os reusa.
+    const inputs = merchandiseCatalogInputs(merchandise, stock)
+    const { id: brandId }   = await ensureAndLinkCatalogItem('tb_brand',   schemaName, institutionId, inputs.brand)
+    const { id: packageId } = await ensureAndLinkCatalogItem('tb_package', schemaName, institutionId, inputs.package)
+    const { id: measureId } = await ensureAndLinkCatalogItem('tb_measure', schemaName, institutionId, inputs.measure)
+
+    // só agora a conexão da transação principal (quem chama o catálogo não pode
+    // segurar outra conexão do pool — sync.catalog.ts)
+    conn = await pool.getConnection()
     await conn.beginTransaction()
-
-    // Catálogos centrais por DESCRIÇÃO (D5/D17) — fallback legado documentado
-    const brandDesc   = merchandise.nameBrand?.trim()  || 'NÃO INFORMADA'
-    const packageDesc = stock.namePackage?.trim()      || 'UND'
-    const measureDesc = stock.nameMeasure?.trim()      || 'UND'
-    const { id: brandId }   = await ensureCatalogItem(conn, 'tb_brand',   brandDesc)
-    const { id: packageId } = await ensureCatalogItem(conn, 'tb_package', packageDesc)
-    const { id: measureId } = await ensureCatalogItem(conn, 'tb_measure', measureDesc)
-
+    inTransaction = true
     await conn.query(`USE \`${schemaName}\``)
 
-    // Vínculos vivos no schema do cliente (sem attrs: não mexe no active do vínculo)
-    await upsertCatalogLink(conn, 'tb_institution_has_brand',   'tb_brand_id',   institutionId, brandId)
-    await upsertCatalogLink(conn, 'tb_institution_has_package', 'tb_package_id', institutionId, packageId)
-    await upsertCatalogLink(conn, 'tb_institution_has_measure', 'tb_measure_id', institutionId, measureId)
-
-    // Categoria por id local — precisa já ter sido sincronizada
-    const [cats] = await conn.query<any[]>(
-      `SELECT id FROM tb_category
-       WHERE id = ? AND tb_institution_id = ? AND deleted = 'N' LIMIT 1`,
-      [product.categoryId, institutionId]
-    )
-    if (!cats.length) {
-      throw new HttpError(409, `Categoria ${product.categoryId} ainda não sincronizada`,
-        [{ field: 'product.categoryId', message: 'sincronize a categoria antes — reenvio no próximo ciclo' }],
-        'CATEGORY_NOT_SYNCED')
-    }
+    // Categoria por id local — precisa já ter sido sincronizada (a conferência que VALE)
+    await assertCategorySynced(conn, schemaName, institutionId, product.categoryId)
 
     // ── tb_product (PK id + tb_institution_id) ──────────────────────────
     const [exProduct] = await conn.query<any[]>(
@@ -327,9 +380,10 @@ router.post('/merchandise/sincronize', async (req: Request, res: Response) => {
     }
 
     await conn.commit()
+    inTransaction = false
     res.json(syncSuccess(id))
   } catch (err: any) {
-    await conn.rollback()
+    if (conn && inTransaction) await conn.rollback().catch(() => undefined)
     if (err instanceof HttpError) {
       res.status(err.statusCode).json({ ok: false, error: err.message, fields: err.fields, code: err.code })
       return
@@ -337,7 +391,7 @@ router.post('/merchandise/sincronize', async (req: Request, res: Response) => {
     logger.error('Erro em /merchandise/sincronize', { err, client: req.syncClient })
     res.status(500).json(syncError(err.message))
   } finally {
-    conn.release()
+    conn?.release()
   }
 })
 

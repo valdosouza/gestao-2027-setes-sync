@@ -29,7 +29,12 @@ const options = {
           type: 'apiKey',
           in: 'header',
           name: 'X-Api-Key',
-          description: 'API Key para autenticação do Sincronizador',
+          description:
+            'API Key da instalação (setes_central.tb_sync_api_key — D12). Recusas em TODO /sincronize ' +
+            '(D-SY13): 401 SYNC_KEY_MISSING (header ausente), 401 SYNC_KEY_INVALID (chave inexistente), ' +
+            '403 SYNC_KEY_INACTIVE (chave existente e inativa). O Sincronizador para a sincronia sem marcar ' +
+            'o SRC_LOG e fica inativo até o usuário ativar (consulta em GET /sync-key/status). A chave válida ' +
+            'fica em cache 5 min no processo (limite conhecido: desativar vale em até 5 min).',
         },
       },
       schemas: {
