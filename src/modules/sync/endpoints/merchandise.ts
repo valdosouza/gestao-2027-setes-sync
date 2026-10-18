@@ -58,7 +58,10 @@ const merchandiseBlock = z.object({
   // PRO_COMPOSICAO espelhado COMO ESTÁ ('1'/'2'/'3'/'5' no legado — decisão
   // Valdo 2026-08-01; snFlag S/N barrava o catálogo inteiro, 8.588 itens)
   composition:       legacyChar(),
-  manufSignIndScale: snFlag('S'),
+  // INDESCALA do legado (D-SY5, Valdo 2026-10-17): S/N como está; vazio ou
+  // ausente = NULL ("não informado" — o legado omite a tag indEscala da NF-e).
+  // Antes o default 'S' trocava o "não informado" por "relevante".
+  manufSignIndScale: snFlag(),
 })
 
 const stockBlock = z.object({
@@ -81,7 +84,7 @@ const stockBlock = z.object({
   outline:          snFlag(),
 })
 
-const merchandiseBody = z.object({
+export const merchandiseBody = z.object({
   id:          z.number().int().positive(),
   deleted:     z.enum(['S', 'N']).optional().default('N'),
   product:     productBlock,
@@ -144,9 +147,9 @@ const merchandiseBody = z.object({
  *                   print: { type: string, enum: [S, N] }
  *                   controlSeries: { type: string, enum: [S, N] }
  *                   exclusiveDealer: { type: string, enum: [S, N] }
- *                   application: { type: string }
- *                   composition: { type: string, enum: [S, N] }
- *                   manufSignIndScale: { type: string, enum: [S, N] }
+ *                   application: { type: string, description: "PRO_APLICACAO em TEXTO (o Sincronizador decodifica o Base64 do legado — D-SY6)" }
+ *                   composition: { type: string, example: "1", description: "PRO_COMPOSICAO como está ('1'…'6')" }
+ *                   manufSignIndScale: { type: string, enum: [S, N], description: "INDESCALA; vazio/ausente = NULL (não informado — D-SY5)" }
  *               stock:
  *                 type: object
  *                 properties:
@@ -263,7 +266,7 @@ router.post('/merchandise/sincronize', async (req: Request, res: Response) => {
       merchandise.kindTributary ?? null, merchandise.source ?? null, merchandise.kind ?? null,
       brandId, merchandise.print ?? null, merchandise.controlSeries ?? null,
       merchandise.exclusiveDealer ?? null, merchandise.application ?? null,
-      merchandise.composition ?? null, merchandise.manufSignIndScale, deleted,
+      merchandise.composition ?? null, merchandise.manufSignIndScale ?? null, deleted,
     ]
     if (exMerch.length) {
       await conn.query(
