@@ -16,6 +16,12 @@
  * desenho mudou, etc.) e você quer recomeçar do zero sem recriar o
  * institution inteiro (chave de API, schema, migrations continuam válidos).
  *
+ * EXCEÇÃO à regra "nada se apaga fisicamente" — registrada no
+ * Infra-IA/database/PADROES_BANCO.md §3.1 (D-SY8, Valdo 2026-10-18): ferramenta
+ * de ENSAIO em ambiente de teste, nunca contra cliente real; vai morrer.
+ * ⚠️ Apaga TODAS as entidades da setes_central exceto KEEP_ENTITY_ID (não só
+ * as deste institution) e não conhece a tb_merchandise_trade_unit.
+ *
  * ⚠️ DESTRUTIVO e IRREVERSÍVEL. Roda em modo DRY-RUN por padrão (só mostra o
  * que seria apagado). Passe --confirm para executar de verdade:
  *
