@@ -5,6 +5,7 @@ import { syncSuccess, syncError } from '../sync.response'
 import { userRefBody, resolveUserId } from '../sync.user'
 import { HttpError } from '@shared/errors/http-error'
 import logger from '@shared/logger/logger'
+import { institutionZoneFor, toUtcDb } from '@shared/time-zone'
 
 const router = Router()
 
@@ -18,6 +19,11 @@ const router = Router()
  * deste endpoint — fechamento por forma de pagamento entra em endpoint
  * próprio quando a onda de movimento financeiro o definir.
  * Contrato: CONTRATOS_SYNC.md.
+ *
+ * FUSO (D-TZ4, a mesma regra do setes-api): `hrBegin`/`hrEnd` chegam do Delphi em
+ * hora de PAREDE do estabelecimento e são gravados como INSTANTE UTC (a sessão do
+ * banco é '+00:00' e as colunas são TIMESTAMP) — `toUtcDb` pela zona configurada.
+ * `dtRecord` é data de NEGÓCIO: vai como veio (o fuso não a toca).
  */
 const DATETIME_RX = /^\d{4}-\d{2}-\d{2}([ T]\d{2}:\d{2}(:\d{2})?)?$/
 
@@ -82,6 +88,18 @@ router.post('/cashier/sincronize', async (req: Request, res: Response) => {
 
     await conn.beginTransaction()
 
+    // D-TZ4: parede do legado → instante UTC, pela zona do estabelecimento (lida pela conn da transação)
+    const zone = (b.hrBegin || b.hrEnd) ? await institutionZoneFor(schemaName, institutionId, conn) : null
+    const toInstant = (field: 'hrBegin' | 'hrEnd'): string | null => {
+      const v = b[field]
+      if (!v) return null
+      const utc = toUtcDb(v, zone!)
+      if (utc === null) throw new HttpError(400, 'Payload inválido', [{ field, message: 'data/hora impossível' }])
+      return utc
+    }
+    const hrBegin = toInstant('hrBegin')
+    const hrEnd = toInstant('hrEnd')
+
     // Autor (decisão 6) — resolve na central ANTES do USE
     const userId = b.user ? await resolveUserId(conn, b.user, institutionId) : null
 
@@ -98,7 +116,7 @@ router.post('/cashier/sincronize', async (req: Request, res: Response) => {
          hr_end = VALUES(hr_end), deleted = VALUES(deleted), updated_at = NOW()`,
       // tb_user_id só atualiza quando o bloco `user` veio (decisão 5).
       [b.id, institutionId, b.terminal, b.dtRecord, userId,
-       b.hrBegin ?? null, b.hrEnd ?? null, b.deleted]
+       hrBegin, hrEnd, b.deleted]
     )
 
     await conn.commit()
