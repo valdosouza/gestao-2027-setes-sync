@@ -104,12 +104,12 @@ const srv = app.listen(PORT, async () => {
     const [[saleRow]] = await pool.query<any[]>(
       `SELECT tb_customer_id FROM setes_setes.tb_order_sale WHERE id = ${ORDER} AND tb_institution_id = 1`) as any
     const [[svcRow]] = await pool.query<any[]>(
-      `SELECT tb_customer_id, open_lock FROM setes_setes.tb_order_service WHERE id = ${ORDER} AND tb_institution_id = 1`) as any
+      `SELECT tb_customer_id FROM setes_setes.tb_order_service WHERE id = ${ORDER} AND tb_institution_id = 1`) as any
     const [itemRows] = await pool.query<any[]>(
       `SELECT id, kind FROM setes_setes.tb_order_item
        WHERE tb_order_id = ${ORDER} AND tb_institution_id = 1 AND deleted = 'N' ORDER BY kind`) as any
     check('conjugado: 1 order + 2 ramos + itens Sale/Service',
-      orderRows.length === 1 && !!saleRow && !!svcRow && svcRow.open_lock === null &&
+      orderRows.length === 1 && !!saleRow && !!svcRow &&
       itemRows.length === 2 && itemRows.some((i: any) => i.kind === 'Sale') && itemRows.some((i: any) => i.kind === 'Service'))
 
     // 3. Snapshots ESCOPADOS: atualizar só os saleItems não pode tocar os Service

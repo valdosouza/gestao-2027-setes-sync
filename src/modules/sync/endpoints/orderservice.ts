@@ -27,8 +27,8 @@ const router = Router()
  * Snapshots ESCOPADOS por kind ('Service' e 'Sale' separados).
  * Totalizer/billing são ÚNICOS do pedido ("listas separadas, totalizadas
  * juntas"). Cliente por DOCUMENTO (D3) com papel verificado; o ramo
- * tb_order_service não tem vendedor (number + tb_customer_id; open_lock
- * NULL — a UNIQUE da tela de processo aceita N nulls). AUTOR via bloco
+ * tb_order_service não tem vendedor (number + tb_customer_id; a trava da OS
+ * é de tb_service_order, que o sync nunca grava — Q-C4). AUTOR via bloco
  * `user`. deleted='S' = pedido inteiro: derruba TODOS os ramos e itens.
  * Contrato: CONTRATOS_SYNC.md.
  */
@@ -335,11 +335,12 @@ router.post('/order-service/sincronize', async (req: Request, res: Response) => 
        order.origin, order.status ?? null, deleted]
     )
 
-    // 5. tb_order_service (ramo — open_lock NULL: pedido do sync já nasce fechado)
+    // 5. tb_order_service (ramo — a trava da OS vive em tb_service_order, que o
+    //    sync nunca grava; a natureza não tem trava — Q-C4 / NOTA.E6.P1)
     await conn.query(
       `INSERT INTO tb_order_service
-         (id, tb_institution_id, terminal, number, tb_customer_id, open_lock, deleted, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, NULL, ?, NOW(), NOW())
+         (id, tb_institution_id, terminal, number, tb_customer_id, deleted, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, NOW(), NOW())
        ON DUPLICATE KEY UPDATE
          number = VALUES(number), tb_customer_id = VALUES(tb_customer_id),
          deleted = VALUES(deleted), updated_at = NOW()`,
